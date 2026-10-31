@@ -22,11 +22,14 @@ is lost.
 Keys:  arrows / WASD   move (into monsters to fight, into people to talk)
        space           wait a turn        P   drink a healing potion
        M               map                ?   help
-       + / -           zoom in / out      V   sound on / off
+       + / -           zoom in / out      V   sound effects on / off
+       B               music on / off
        N               new game           Ctrl-Q / Cmd-Q   quit
 
-Sound effects are synthesized at startup and played with afplay (macOS),
-paplay or aplay if one is available; otherwise the game is silent.
+Sound effects and chiptune music (a tune each for the wilderness, towns,
+the castle and dungeons) are synthesized and played with afplay (macOS),
+paplay or aplay if one is available; otherwise the game is silent.  The
+music is rendered once and cached in ~/.cache/penultimate.
 
 App bundle (macOS):  penultimate --build-app [DIR]   builds penultimate.app
                      penultimate --icon-png SIZE [OUT.png]
@@ -828,18 +831,193 @@ def dungeon_monster(d, level):
 # with whatever command-line player the system has.
 
 RATE = 22050
+MUSIC_CACHE = os.path.expanduser("~/.cache/penultimate")
+MUSIC_VOLUME = 0.6              # relative to the sound effects
+
+# ── Music ────────────────────────────────────────────────────────────────────
+#
+# Chiptune loops, one per kind of place.  A tune is a chord per bar plus
+# voices written as steps (eighth notes): a note such as "F#4" starts a note,
+# "-" holds it and "." is silence.  The lead is written out in full; bass,
+# harmony and arpeggio voices are one-bar patterns replayed over each bar's
+# chord, where R, T and F are the chord's root, third and fifth followed by
+# an octave ("F3" is the fifth, in the octave above the root of octave 3).
+# Drums: k kick, s snare, h hi-hat.
+
+MUSIC = {
+    "world": {      # bold and open, for the road
+        "tempo": 280, "bar": 8,
+        "chords": "C G Am F  C G F G  Am F C G  F G C C",
+        "lead": ("square", 0.25, 0.09),
+        "melody": """
+            E5 - - G5 E5 - C5 -  | D5 - - B4 D5 - G5 -  |
+            C5 - E5 - A5 - G5 E5 | F5 - - - A4 - C5 -   |
+            E5 - G5 - C6 - - -   | B5 - A5 - G5 - D5 -  |
+            C5 - A4 - C5 - F5 -  | D5 - - - - - . .     |
+            A4 - C5 - E5 - A5 -  | A5 - G5 - F5 - C5 -  |
+            E5 - G5 - E5 - C5 -  | D5 - B4 - G4 - B4 -  |
+            C5 - F5 - A5 - C6 -  | B5 - - A5 G5 - D5 -  |
+            E5 - D5 - C5 - G4 -  | C5 - - - - - . .""",
+        "voices": [("triangle", 0.5, 0.20, "R2 . R3 . F2 . R3 ."),
+                   ("square", 0.125, 0.035, ". T4 . F4 . T4 . F4")],
+        "drums": "k . h . s . h h",
+    },
+    "town": {       # a bouncy waltz
+        "tempo": 300, "bar": 6,
+        "chords": "F C Dm Bb  F C Bb C  Dm Bb F C  Bb C F F",
+        "lead": ("square", 0.5, 0.075),
+        "melody": """
+            A4 - C5 - F5 -  | E5 - D5 - C5 -  | D5 - F5 - A5 -  |
+            G5 - F5 - D5 -  | C5 - A4 - C5 -  | G4 - - - . .    |
+            F4 - Bb4 - D5 - | E5 - - - . .    | F5 - E5 - D5 -  |
+            D5 - C5 - Bb4 - | A4 - C5 - F5 -  | E5 - G5 - E5 -  |
+            D5 - F5 - Bb5 - | A5 - G5 - E5 -  | F5 - C5 - A4 -  |
+            F4 - - - . .""",
+        "voices": [("triangle", 0.5, 0.20, "R2 - . . . ."),
+                   ("square", 0.25, 0.04, ". . T4 F4 T4 F4")],
+        "drums": "k . h . h .",
+    },
+    "castle": {     # a stately march
+        "tempo": 200, "bar": 8,
+        "chords": "D A Bm G  D G A A  G A F#m Bm  G A D D",
+        "lead": ("square", 0.25, 0.085),
+        "melody": """
+            F#5 - - - A5 - - -    | E5 - - - C#5 - A4 -  |
+            D5 - F#5 - B5 - - -   | G5 - F#5 - E5 - D5 - |
+            F#5 - A5 - D6 - - -   | B5 - - - G5 - - -    |
+            A5 - G5 - F#5 - E5 -  | E5 - - - - - . .     |
+            D5 - E5 - G5 - - -    | E5 - F#5 - A5 - - -  |
+            F#5 - E5 - C#5 - - -  | D5 - - - B4 - - -    |
+            B4 - D5 - G5 - B5 -   | A5 - - - G5 - E5 -   |
+            F#5 - E5 - D5 - A4 -  | D5 - - - - - . .""",
+        "voices": [("triangle", 0.5, 0.20, "R2 - - - F2 - - -"),
+                   ("square", 0.5, 0.03, "T4 - F4 - T4 - F4 -")],
+        "drums": "k . s . k . s s",
+    },
+    "dungeon": {    # slow and wary
+        "tempo": 168, "bar": 8,
+        "chords": "Am Am F E  Am Dm E E  Am G F E  Dm E Am Am",
+        "lead": ("square", 0.125, 0.07),
+        "melody": """
+            A4 - - - - - - -   | C5 - - - B4 - - -  |
+            A4 - - - F4 - - -  | E4 - - - G#4 - - - |
+            A4 - - - E5 - - -  | F5 - - - D5 - - -  |
+            E5 - - - D5 - C5 - | B4 - - - - - - -   |
+            E5 - - - C5 - - -  | D5 - - - B4 - - -  |
+            C5 - - - A4 - - -  | G#4 - - - B4 - - - |
+            A4 - - - F4 - - -  | G#4 - - - E4 - - - |
+            A4 - - - - - - -   | . . . . . . . .""",
+        "voices": [("triangle", 0.5, 0.20, "R2 - - - - - - -"),
+                   ("square", 0.5, 0.03, "R3 F3 R4 F3 T4 F3 R4 F3")],
+        "drums": "k . . . . . . .",
+    },
+}
+
+NOTE_STEPS = {"C": 0, "D": 2, "E": 4, "F": 5, "G": 7, "A": 9, "B": 11}
+
+
+def note_number(name):
+    """MIDI note number of a name such as 'C#4' or 'Bb3'."""
+    n = NOTE_STEPS[name[0]] + 12 * (int(name[-1]) + 1)
+    return n + name[1:-1].count("#") - name[1:-1].count("b")
+
+
+def freq_of(midi):
+    return 440.0 * 2 ** ((midi - 69) / 12)
+
+
+def chord_note(chord, token):
+    """Pitch of pattern token R/T/F<octave> over a chord such as 'F#m'."""
+    minor = chord.endswith("m")
+    root = note_number((chord[:-1] if minor else chord) + token[1])
+    return root + {"R": 0, "T": 3 if minor else 4, "F": 7}[token[0]]
+
+
+def synth_note(buf, start, n, freq, wave, duty, gain):
+    att = int(0.004 * RATE)
+    rel = max(1, min(int(0.025 * RATE), n // 3))
+    step = freq / RATE
+    for k in range(min(n, len(buf) - start)):
+        ph = (k * step) % 1.0
+        if wave == "square":
+            v = 1.0 if ph < duty else -1.0
+        else:
+            v = 4 * ph - 1 if ph < 0.5 else 3 - 4 * ph
+        env = gain * (1 - 0.3 * k / n)
+        if k < att:
+            env *= k / att
+        elif k > n - rel:
+            env *= (n - k) / rel
+        buf[start + k] += v * env
+
+
+def synth_drum(buf, start, kind, rng):
+    if kind == "k":                                  # falling sine thump
+        n = int(0.12 * RATE)
+        for k in range(min(n, len(buf) - start)):
+            t = k / RATE
+            buf[start + k] += 0.35 * (1 - k / n) ** 2 * math.sin(
+                2 * math.pi * (110 * t - 160 * t * t))
+        return
+    n, gain, a = ((int(0.11 * RATE), 0.12, 0.75) if kind == "s"
+                  else (int(0.03 * RATE), 0.06, 0.95))
+    y = x_prev = 0.0
+    for k in range(min(n, len(buf) - start)):
+        x = rng.uniform(-1, 1)
+        y = a * (y + x - x_prev)                     # high-passed noise
+        x_prev = x
+        buf[start + k] += y * gain * (1 - k / n) ** 2
+
+
+def render_tune(tune):
+    step = int(RATE * 60 / tune["tempo"])
+    chords = tune["chords"].split()
+    bar = tune["bar"]
+    nsteps = len(chords) * bar
+    buf = [0.0] * (nsteps * step)
+
+    def play(tokens, wave, duty, gain, pitch):
+        i = 0
+        while i < len(tokens):
+            j = i + 1
+            while j < len(tokens) and tokens[j] == "-":
+                j += 1
+            if tokens[i] not in ".-":
+                synth_note(buf, i * step, (j - i) * step,
+                           freq_of(pitch(i, tokens[i])), wave, duty, gain)
+            i = j
+
+    melody = tune["melody"].replace("|", " ").split()
+    if len(melody) != nsteps:
+        raise ValueError("melody has %d steps, not %d" % (len(melody), nsteps))
+    wave, duty, gain = tune["lead"]
+    play(melody, wave, duty, gain, lambda i, t: note_number(t))
+    for wave, duty, gain, pattern in tune["voices"]:
+        play(pattern.split() * len(chords), wave, duty, gain,
+             lambda i, t: chord_note(chords[i // bar], t))
+    rng = random.Random(1)
+    for i, t in enumerate(tune["drums"].split() * len(chords)):
+        if t != ".":
+            synth_drum(buf, i * step, t, rng)
+    return [v * MUSIC_VOLUME for v in buf]
 
 
 class Sound:
     def __init__(self):
         self.muted = False
+        self.music_off = False
+        self.tune = None            # the tune that should be playing
+        self.music_proc = None
+        self.music_playing = None
         self.player = None
         for cmd in (["afplay"], ["paplay"], ["aplay", "-q"]):
             if shutil.which(cmd[0]):
                 self.player = cmd
                 break
         self.files = {}
+        self.tunes = {}
         if self.player:
+            atexit.register(self.stop_music)
             self.dir = tempfile.mkdtemp(prefix="penultimate-")
             atexit.register(shutil.rmtree, self.dir, True)
             threading.Thread(target=self.synthesize, daemon=True).start()
@@ -884,8 +1062,8 @@ class Sound:
             env = gain * (0.0001 / gain) ** (k / n)
             buf[start + k] += y * env
 
-    def write(self, name, buf):
-        path = os.path.join(self.dir, name + ".wav")
+    def write(self, name, buf, path=None):
+        path = path or os.path.join(self.dir, name + ".wav")
         pcm = array.array("h", (int(max(-1.0, min(1.0, v)) * 32000)
                                 for v in buf + [0.0] * 200))
         if sys.byteorder == "big":
@@ -896,6 +1074,7 @@ class Sound:
             w.setframerate(RATE)
             w.writeframes(pcm.tobytes())
         self.files[name] = path
+        return path
 
     def synthesize(self):
         tone, noise = self.tone, self.noise
@@ -953,6 +1132,49 @@ class Sound:
         tone(b, 0.04, 200, 0.2, "sine", 0.1)
         noise(b, 0, 0.25, 300, 0.2)
         self.write("fire", b)
+        self.synthesize_music()
+
+    def synthesize_music(self):
+        """Render each tune once; the WAVs are cached between runs, named
+        by a checksum of the tune so editing a tune re-renders it."""
+        order = sorted(MUSIC, key=lambda n: n != (self.tune or "world"))
+        for name in order:
+            tune = MUSIC[name]
+            sig = zlib.crc32(json.dumps([tune, RATE], sort_keys=True).encode())
+            path = os.path.join(MUSIC_CACHE, "%s-%08x.wav" % (name, sig))
+            if not os.path.exists(path):
+                try:
+                    os.makedirs(MUSIC_CACHE, exist_ok=True)
+                    tmp = path + ".tmp"
+                    self.write("music-" + name, render_tune(tune), tmp)
+                    os.replace(tmp, path)
+                except OSError:
+                    path = self.write("music-" + name, render_tune(tune))
+            self.tunes[name] = path
+
+    # Music loops by restarting the player whenever it finishes; tick() is
+    # called a few times a second.
+
+    def tick(self):
+        want = None if self.music_off else self.tunes.get(self.tune)
+        proc = self.music_proc
+        if want == self.music_playing and proc and proc.poll() is None:
+            return
+        if want != self.music_playing or (proc and proc.poll() is not None):
+            self.stop_music()
+        if want:
+            try:
+                self.music_proc = subprocess.Popen(
+                    self.player + [want], stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL)
+                self.music_playing = want
+            except OSError:
+                self.music_off = True
+
+    def stop_music(self):
+        if self.music_proc and self.music_proc.poll() is None:
+            self.music_proc.terminate()
+        self.music_proc = self.music_playing = None
 
     def play(self, name):
         path = self.files.get(name)
@@ -1013,7 +1235,8 @@ Space               wait a turn
 P                   drink a healing potion
 M                   map of the lands you have seen
 + / -               zoom in / out
-V                   sound on / off
+V                   sound effects on / off
+B                   music on / off
 N                   new game (a whole new world)
 Ctrl-Q / Cmd-Q      quit (the game is saved)
 
@@ -1033,6 +1256,7 @@ class Game:
         self.sound = Sound()
         saved = load_saved()
         self.sound.muted = bool(saved.get("muted"))
+        self.sound.music_off = bool(saved.get("music_off"))
         scale = saved.get("scale")
         self.scale = scale if scale in (1, 2, 3, 4) else (
             3 if root.winfo_screenheight() >= 1000 else 2)
@@ -1063,6 +1287,7 @@ class Game:
                                 ("out", "Zoom -", lambda: self.zoom(-1)),
                                 ("in", "Zoom +", lambda: self.zoom(1)),
                                 ("mute", "Sound: on", self.toggle_mute),
+                                ("music", "Music: on", self.toggle_music),
                                 ("new", "New Game", self.ask_new_game)):
             b = tk.Button(bar, text=label, command=cmd, width=9,
                           highlightbackground=PANEL, takefocus=0)
@@ -1128,6 +1353,11 @@ class Game:
             self.restore(saved["game"])
         except (KeyError, TypeError, ValueError, IndexError, zlib.error):
             self.new_game()
+        self.music_tick()
+
+    def music_tick(self):
+        self.sound.tick()
+        self.root.after(100, self.music_tick)
 
     # ── Images ──
 
@@ -1224,7 +1454,8 @@ class Game:
         self.layout()
 
     def save(self):
-        data = {"muted": self.sound.muted, "scale": self.scale}
+        data = {"muted": self.sound.muted, "music_off": self.sound.music_off,
+                "scale": self.scale}
         if getattr(self, "p", None):
             data["game"] = {
                 "seed": self.world["seed"], "player": self.p,
@@ -1241,6 +1472,7 @@ class Game:
 
     def quit(self):
         self.save()
+        self.sound.stop_music()
         self.root.destroy()
 
     # ── Areas ──
@@ -1347,6 +1579,8 @@ class Game:
             self.show_help()
         elif k in ("v", "V"):
             self.toggle_mute()
+        elif k in ("b", "B"):
+            self.toggle_music()
         elif k in ("plus", "equal", "KP_Add"):
             self.zoom(1)
         elif k in ("minus", "underscore", "KP_Subtract"):
@@ -2190,6 +2424,9 @@ class Game:
         self.condition.config(text="\n".join(cond))
         self.btn["mute"].config(
             text="Sound: off" if self.sound.muted else "Sound: on")
+        self.btn["music"].config(
+            text="Music: off" if self.sound.music_off else "Music: on")
+        self.sound.tune = self.area.kind
 
     # ── Commands ──
 
@@ -2214,6 +2451,11 @@ class Game:
 
     def toggle_mute(self):
         self.sound.muted = not self.sound.muted
+        self.render_chrome()
+
+    def toggle_music(self):
+        self.sound.music_off = not self.sound.music_off
+        self.sound.tick()
         self.render_chrome()
 
     def ask_new_game(self):

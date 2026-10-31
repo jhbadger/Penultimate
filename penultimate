@@ -29,12 +29,15 @@ start with a hockey puck sling.  Outfitters sell canoes (carry one and you
 can paddle onto any water), slings and pucks; mages sell spellbooks.  Days
 pass as you play: at night you see less, more monsters prowl, and only inns
 and taverns stay open.  Islands off the coast hold inukshuks with gifts
-beneath them.
+beneath them.  Townsfolk who need HELP offer errands: slaying monsters,
+fetching stolen things from dungeons, catching runaway geese and carrying
+parcels to other towns.
 
 Keys:  arrows / WASD   move (into monsters to fight, into people to talk)
        F + direction   fire a hockey puck   C + number   cast a spell
        space           wait a turn        P   drink a healing potion
-       M               map                ?   help
+       M               map                J   journal (quest and errands)
+       ?               help
        + / -           zoom in / out      V   sound effects on / off
        B               music on / off
        N               new game           Ctrl-Q / Cmd-Q   quit
@@ -92,7 +95,7 @@ SPRITES = {"avatar", "lord", "guard", "man", "woman", "merchant", "jester",
            "rat", "bat", "snake", "slime", "wolf", "goblin", "orc",
            "skeleton", "spider", "troll", "ghost", "daemon", "dragon",
            "serpent", "moosedain", "witch", "beaver", "wizard", "canoe",
-           "hit", "bolt", "puck", "frost"}
+           "goose", "hit", "bolt", "puck", "frost"}
 SITE_COLORS = {"town": "#ff5040", "castle": "#ffffff", "dungeon": "#ffa020",
                "lair": "#d040ff"}
 DIRS = ((0, -1), (0, 1), (-1, 0), (1, 0))
@@ -289,6 +292,7 @@ TIPS = [
     "Drink a healing potion when thou art hurt: press P.",
     "Lord Canadian raises thy level when thou hast gained the experience.",
     "Treasure chests lie deep in the dungeons.",
+    "Townsfolk often need HELP with errands, and pay for it. Ask around!",
     "Mages in the towns sell spellbooks. Press C to cast what thou knowest.",
     "Outfitters sell canoes: carry one, and thou canst paddle the lakes and "
     "seas. Press F to fire a hockey puck sling, if thou hast one.",
@@ -565,6 +569,130 @@ def place_inukshuks(world):
         grid[y][x] = "inukshuk"
 
 
+# ── Side quests ──────────────────────────────────────────────────────────────
+#
+# Two errands per town, chosen from the seed like everything else: slay
+# some monsters, fetch something from a dungeon, catch a runaway goose, or
+# carry a parcel to a shopkeeper in another town.
+
+SIDE_ITEMS = ["a grandfather's pocket watch", "the town's lucky curling stone",
+              "a wedding ring", "a jar of grandmother's maple fudge",
+              "a lucky toque", "the chapel bell's clapper",
+              "a book of terrible poems", "a prize-winning pie dish"]
+DELIVERIES = ["a crate of maple syrup", "a love letter", "a parcel of poutine",
+              "a hockey stick for a nephew", "a wheel of cheese curds",
+              "a box of apology cards", "a very polite complaint"]
+GOOSE_NAMES = ["Honker", "Gertrude", "Admiral Flap", "Mabel",
+               "Sir Hisses-a-Lot", "Duchess", "Pickles"]
+ERRAND_WORDS = ("help", "ques", "work", "task", "erra", "chor")
+
+
+def plural(name):
+    if name.endswith("f"):
+        return name[:-1] + "ves"
+    return name + ("es" if name.endswith("ch") else "s")
+
+
+def make_side_quests(world):
+    rng = random.Random("%s:side" % world["seed"])
+    grid = world["grid"]
+    cx, cy = world["castle"]
+    mainland = set(flood(grid, world["castle"],
+                         LAND | {"town", "castle", "dungeon", "lair"}))
+    used = set()                     # (town, shop) parcels go to
+    out = []
+
+    def hunt(q, here):
+        danger = max(1, min(6, 1 + int(math.hypot(here[0] - cx,
+                                                  here[1] - cy) // 8)))
+        kinds = [k for k, m in MONSTERS.items()
+                 if m.habitat in ("world", "both", "forest")
+                 and danger - 1 <= m.tier <= danger]
+        q["monster"] = rng.choice(kinds)
+        q["count"] = rng.randint(3, 6)
+        tier = MONSTERS[q["monster"]].tier
+        q["gold"] = 20 + 15 * q["count"] * tier
+        q["xp"] = 10 * q["count"] * tier
+        return True
+
+    def fetch(q, here):
+        di = rng.randrange(5)
+        d = world["dungeons"][di]
+        q.update(dungeon=di, level=rng.randint(1, d["levels"]),
+                 item=rng.choice(SIDE_ITEMS))
+        v = d["tier"] + q["level"]
+        q["gold"], q["xp"] = 50 * v, 30 * v
+        return True
+
+    def goose(q, here):
+        spots = [(x, y) for (x, y) in sorted(mainland)
+                 if grid[y][x] in ("grass", "sand", "hills")
+                 and 5 <= abs(x - here[0]) + abs(y - here[1]) <= 12]
+        if not spots:
+            return False
+        q["home"] = rng.choice(spots)
+        q["goose"] = rng.choice(GOOSE_NAMES)
+        dist = abs(q["home"][0] - here[0]) + abs(q["home"][1] - here[1])
+        q["gold"], q["xp"] = 40 + 3 * dist, 30
+        return True
+
+    def deliver(q, here):
+        options = [(tj, sk) for tj in range(len(world["towns"]))
+                   if tj != q["town"]
+                   for sk in SHOP_KINDS + ["outfitter", "mage"]
+                   if (tj, sk) not in used]
+        tj, sk = rng.choice(options)
+        used.add((tj, sk))
+        t = world["towns"][tj]
+        dist = math.hypot(t["x"] - here[0], t["y"] - here[1])
+        q.update(to_town=tj, to_shop=sk, to=rng.choice(FIRST_NAMES),
+                 item=rng.choice(DELIVERIES), gold=int(30 + 4 * dist),
+                 xp=int(20 + 2 * dist))
+        return True
+
+    makers = {"hunt": hunt, "fetch": fetch, "goose": goose,
+              "deliver": deliver}
+    for ti, t in enumerate(world["towns"]):
+        here = (t["x"], t["y"])
+        kinds = rng.sample(sorted(makers), 4)
+        slot = 0
+        for kind in kinds:
+            q = {"id": str(len(out)), "town": ti, "slot": slot, "kind": kind,
+                 "giver": rng.choice(FIRST_NAMES)}
+            if makers[kind](q, here):
+                out.append(q)
+                slot += 1
+                if slot == 2:
+                    break
+    world["side"] = out
+
+
+def errand_text(world, q):
+    """What the quest giver asks of thee."""
+    town = world["towns"][q["town"]]
+    here = (town["x"], town["y"])
+    if q["kind"] == "hunt":
+        return ("%s have been troubling us. Slay %d of them and I'll pay "
+                "thee %d gold." % (cap(plural(MONSTERS[q["monster"]].name)),
+                                   q["count"], q["gold"]))
+    if q["kind"] == "fetch":
+        d = world["dungeons"][q["dungeon"]]
+        return ("Goblins stole %s and carried it off to %s, %s of here. "
+                "It'll be in a chest on level %d, I'll wager. Bring it back "
+                "and I'll pay thee %d gold!" % (
+                    q["item"], d["name"], where(here, (d["x"], d["y"])),
+                    q["level"], q["gold"]))
+    if q["kind"] == "goose":
+        return ("My prize goose, %s, has run off! She was last seen %s of "
+                "town. Catch her and bring her home, and I'll pay thee %d "
+                "gold." % (q["goose"], where(here, q["home"]), q["gold"]))
+    t = world["towns"][q["to_town"]]
+    return ("Could thou take %s to %s, %s in %s? It lies %s of here. %s "
+            "will pay thee %d gold for thy trouble." % (
+                q["item"], q["to"], SHOP_TITLES[q["to_shop"]], t["name"],
+                where(here, (t["x"], t["y"])), q["to"], q["gold"]))
+
+
 # ── Maps and creatures ───────────────────────────────────────────────────────
 
 class Area:
@@ -611,6 +739,10 @@ class Mob:
         self.lord = False
         self.greet = ""
         self.flee = 0               # monster: turns left running away
+        self.quest = None           # person: id of the errand they offer
+        self.recipient = None       # shopkeeper: id of a parcel for them
+        self.goose = None           # a runaway goose: its errand's id
+        self.home = None            # where a goose stays near
 
 
 def make_monster(kind, x, y):
@@ -783,10 +915,23 @@ def make_town(world, ti):
              "monster": "Monsters grow fiercer the farther thou travellest "
              "from Lord Canadian's castle. Start close to home.",
              "news": rng.choice(town_rumours(world, here))}))
+    folks = []
     for _ in range(6):
         x, y = free_spot(("grass", "cobble"))
-        area.mobs.append(townsfolk(rng, world, here, x, y,
-                                   {"grass", "cobble"}))
+        folks.append(townsfolk(rng, world, here, x, y, {"grass", "cobble"}))
+    area.mobs += folks
+    for q in world.get("side", []):
+        if q["town"] == ti:
+            m = folks[q["slot"]]
+            m.name, m.quest = q["giver"], q["id"]
+            m.talk["name"] = "My name is %s." % q["giver"]
+            m.talk["job"] += " And I could use some HELP, if thou art willing."
+            m.greet = "Oh! Thou look'st like an adventurer. Couldst thou HELP me?"
+        if q["kind"] == "deliver" and q["to_town"] == ti:
+            m = next(k for k in area.mobs
+                     if k.shop and k.shop["kind"] == q["to_shop"])
+            m.name, m.recipient = q["to"], q["id"]
+            m.talk["name"] = "My name is %s." % q["to"]
     return area
 
 
@@ -959,6 +1104,16 @@ def make_dungeon_level(world, di, level, flags):
                 g[y][x] = "chest"
     if last and d["boss"] and "boss:%d" % di not in flags:
         area.mobs.append(make_boss(d, di, far[0], far[1]))
+    area.errand_chests = {}
+    for q in world.get("side", []):
+        if (q["kind"] == "fetch" and q["dungeon"] == di and
+                q["level"] == level and "item:" + q["id"] not in flags):
+            spots = [(x, y) for y in range(H) for x in range(W)
+                     if g[y][x] == "dfloor" and (x, y) not in centers]
+            x, y = random.Random("%s:side:%s" % (world["seed"], q["id"])
+                                 ).choice(spots)
+            g[y][x] = "chest"
+            area.errand_chests[(x, y)] = q["id"]
     area.floor = [(x, y) for y in range(H) for x in range(W)
                   if g[y][x] == "dfloor"]
     return area
@@ -1408,6 +1563,7 @@ C + number          cast a spell (aimed ones then
                     ask for a direction)
 P                   drink a healing potion
 M                   map of the lands you have seen
+J                   journal: your quest and errands
 + / -               zoom in / out
 V                   sound effects on / off
 B                   music on / off
@@ -1420,6 +1576,9 @@ Shopkeepers answer BUY; talk across their counters.
 
 Lord Canadian heals you and raises your level once you
 have enough experience. Visit him often.
+
+Townsfolk who need HELP will say so: ask them, and
+they'll send you on errands for gold and experience.
 
 Outfitters sell canoes (paddle the lakes and seas),
 puck slings and pucks; mages sell spellbooks. Nights
@@ -1462,6 +1621,7 @@ class Game:
         self.btn = {}
         for key, label, cmd in (("potion", "Potion", self.drink),
                                 ("map", "Map", self.toggle_map),
+                                ("journal", "Journal", self.journal),
                                 ("help", "Help", self.show_help),
                                 ("out", "Zoom -", lambda: self.zoom(-1)),
                                 ("in", "Zoom +", lambda: self.zoom(1)),
@@ -1579,6 +1739,7 @@ class Game:
     def setup_world(self, seed):
         self.world = generate_world(seed)
         place_inukshuks(self.world)
+        make_side_quests(self.world)
         self.world_area = Area("world", ("world",), self.world["grid"],
                                self.world["realm"], "deep")
         self.cache = {}
@@ -1653,6 +1814,8 @@ class Game:
             self.p[k] = c[k]
         self.p["mp"] = max_mp(self.p)
         self.flags, self.held, self.returned = set(), [], set()
+        self.side = {}
+        self.release_geese()
         self.turn = 0
         cx, cy = self.world["castle"]
         start = next((cx + dx, cy + dy) for dx, dy in ((0, 1), (-1, 0),
@@ -1687,6 +1850,8 @@ class Game:
         self.flags = set(g.get("flags", []))
         self.held = [int(i) for i in g.get("held", [])]
         self.returned = set(int(i) for i in g.get("returned", []))
+        self.side = {str(k): dict(v) for k, v in g.get("side", {}).items()}
+        self.release_geese()
         self.turn = int(g.get("turn", 0))
         self.world_area.seen = unpack_bits(g["seen"], WORLD_W * WORLD_H)
         self.world_pos = [int(v) for v in g["world_pos"]]
@@ -1714,6 +1879,7 @@ class Game:
                 "seed": self.world["seed"], "player": self.p,
                 "flags": sorted(self.flags), "held": self.held,
                 "returned": sorted(self.returned), "turn": self.turn,
+                "side": self.side,
                 "key": list(self.area.key), "pos": self.pos,
                 "world_pos": self.world_pos,
                 "seen": pack_bits(self.world_area.seen)}
@@ -1849,6 +2015,8 @@ class Game:
             self.drink()
         elif k in ("m", "M"):
             self.toggle_map()
+        elif k in ("j", "J"):
+            self.journal()
         elif k in ("question", "slash", "h", "H", "F1"):
             self.show_help()
         elif k in ("v", "V"):
@@ -2048,15 +2216,19 @@ class Game:
         x, y = mob.x + dx, mob.y + dy
         a = self.area
         if (a.inside(x, y) and a.grid[y][x] in mob.roam
-                and not a.mob_at(x, y) and [x, y] != self.pos):
+                and not a.mob_at(x, y) and [x, y] != self.pos
+                and (mob.home is None or abs(x - mob.home[0]) +
+                     abs(y - mob.home[1]) <= 4)):
             mob.x, mob.y = x, y
 
     def spawn_world(self):
         a = self.area
         px, py = self.pos
-        a.mobs = [m for m in a.mobs if abs(m.x - px) + abs(m.y - py) <= 24]
+        a.mobs = [m for m in a.mobs if m.goose is not None
+                  or abs(m.x - px) + abs(m.y - py) <= 24]
         night = self.phase() == "night"
-        if len(a.mobs) >= 6 or random.random() > (0.12 if night else 0.07):
+        if (sum(m.hostile for m in a.mobs) >= 6
+                or random.random() > (0.12 if night else 0.07)):
             return
         for _ in range(10):
             ang = random.random() * 2 * math.pi
@@ -2133,6 +2305,16 @@ class Game:
             self.the(mob), mob.xp, ", %d gold" % gold if gold else ""),
             "good")
         self.sound.play("kill")
+        for q in self.world["side"]:
+            st = self.side.get(q["id"])
+            if (q["kind"] == "hunt" and q["monster"] == mob.kind and st
+                    and st["state"] == "active" and st["count"] < q["count"]):
+                st["count"] += 1
+                town = self.world["towns"][q["town"]]["name"]
+                self.say("(%d of %d %s for %s in %s%s)" % (
+                    st["count"], q["count"], plural(mob.name), q["giver"],
+                    town, ": return for thy reward"
+                    if st["count"] == q["count"] else ""), "info")
         if mob.boss:
             self.flags.add("boss:%d" % mob.dungeon)
             d = self.world["dungeons"][mob.dungeon]
@@ -2226,6 +2408,17 @@ class Game:
         self.enter(self.area, self.pos, "level")
 
     def open_chest(self, x, y):
+        qid = self.area.errand_chests.get((x, y))
+        if qid is not None:
+            q = self.world["side"][int(qid)]
+            self.flags.add("item:" + qid)
+            self.area.grid[y][x] = "dfloor"
+            self.say("Inside the chest you find %s! %s in %s will be glad "
+                     "to see it." % (q["item"], q["giver"],
+                                     self.world["towns"][q["town"]]["name"]),
+                     "quest")
+            self.sound.play("gold")
+            return
         _, di, level = self.area.key
         key = "chest:%d:%d:%d,%d" % (di, level, x, y)
         self.flags.add(key)
@@ -2456,6 +2649,9 @@ class Game:
         self.say("%s says: %s" % (self.speaker(mob), text), "talk")
 
     def start_talk(self, mob):
+        if mob.goose is not None:
+            self.catch_goose(mob)
+            return
         self.talk = {"mob": mob, "mode": "kw"}
         self.talkbar.pack(side="bottom", fill="x", before=self.log)
         self.prompt.config(text="Your interest:")
@@ -2470,8 +2666,19 @@ class Game:
                 self.end_talk()
             return
         self.say("You meet %s." % mob.title, "info")
+        greet = mob.greet
+        if mob.quest is not None:
+            st = self.side.get(mob.quest)
+            greet = (random.choice(GREETINGS) if st and st["state"] == "done"
+                     else "Oh, it's thee! Any luck with my errand?" if st
+                     else greet)
         self.npc_say(mob, "Oh! We're closed for the night, sorry. Come back "
-                     "in the morning." if self.closed(mob) else mob.greet)
+                     "in the morning." if self.closed(mob) else greet)
+        if mob.recipient is not None:
+            self.deliver(mob)
+        if mob.quest is not None and self.side.get(mob.quest, {}).get(
+                "state") == "active" and self.errand_ready(mob.quest):
+            self.finish_errand(mob)
         if "talked" not in self.flags:
             self.flags.add("talked")
             self.say("(Type a word such as NAME, JOB or NEWS and press "
@@ -2534,6 +2741,10 @@ class Game:
             return
         if w.startswith("name"):
             mob.known = True
+        if mob.quest is not None and w.split()[0][:4] in ERRAND_WORDS:
+            self.errand(mob)
+            self.render_chrome()
+            return
         if mob.lord:
             reply = self.lord_reply(w)
         elif mob.shop and w[:3] in ("buy", "pur", "sho", "war", "goo"):
@@ -2551,6 +2762,178 @@ class Game:
             "I don't know anything about that, sorry.",
             "Hmm? Sorry, I'm not sure what thou meanest.")))
         self.render_chrome()
+
+    # ── Errands ──
+
+    def release_geese(self):
+        """Put the runaway geese of errands not yet done out on the map."""
+        a = self.world_area
+        a.mobs = [m for m in a.mobs if m.goose is None]
+        for q in self.world["side"]:
+            if (q["kind"] == "goose" and "goose:" + q["id"] not in self.flags
+                    and self.side.get(q["id"], {}).get("state") != "done"):
+                g = Mob("goose", q["goose"], *q["home"])
+                g.title, g.goose, g.home, g.roam = "a goose", q["id"], \
+                    q["home"], LAND
+                a.mobs.append(g)
+
+    def catch_goose(self, mob):
+        q = self.world["side"][int(mob.goose)]
+        self.area.mobs.remove(mob)
+        self.flags.add("goose:" + q["id"])
+        town = self.world["towns"][q["town"]]["name"]
+        self.say("You scoop up %s the goose. She honks indignantly and "
+                 "nips your ear." % q["goose"], "quest")
+        self.say("Take her home to %s in %s." % (q["giver"], town)
+                 if q["id"] in self.side else
+                 "Someone in %s must be missing her." % town, "info")
+        self.sound.play("gold")
+        self.render()
+
+    def errand_ready(self, qid):
+        q = self.world["side"][int(qid)]
+        st = self.side.get(qid, {})
+        if q["kind"] == "hunt":
+            return st.get("count", 0) >= q["count"]
+        if q["kind"] == "fetch":
+            return "item:" + qid in self.flags
+        if q["kind"] == "goose":
+            return "goose:" + qid in self.flags
+        return False                 # parcels are paid for on delivery
+
+    def errand(self, mob):
+        """A quest giver asked about their errand."""
+        q = self.world["side"][int(mob.quest)]
+        st = self.side.get(q["id"])
+        if st and st["state"] == "done":
+            self.npc_say(mob, "Thou hast done me a great kindness already. "
+                         "Thank thee!")
+            return
+        if st is None:
+            self.side[q["id"]] = {"state": "active", "count": 0}
+            self.npc_say(mob, errand_text(self.world, q))
+            if q["kind"] == "deliver":
+                self.say("You take %s." % q["item"], "info")
+            if self.errand_ready(q["id"]):
+                self.finish_errand(mob)
+            else:
+                self.say("(Errand accepted. Press J to see your journal.)",
+                         "info")
+            self.save()
+            return
+        if self.errand_ready(q["id"]):
+            self.finish_errand(mob)
+            return
+        town = self.world["towns"][q["town"]]
+        here = (town["x"], town["y"])
+        if q["kind"] == "hunt":
+            text = "Thou hast slain %d of the %d %s so far. Keep at it!" % (
+                st["count"], q["count"], plural(MONSTERS[q["monster"]].name))
+        elif q["kind"] == "fetch":
+            d = self.world["dungeons"][q["dungeon"]]
+            text = "Hast thou found %s? It's in %s, on level %d." % (
+                q["item"], d["name"], q["level"])
+        elif q["kind"] == "goose":
+            text = "Hast thou found %s? She was last seen %s of town." % (
+                q["goose"], where(here, q["home"]))
+        else:
+            t = self.world["towns"][q["to_town"]]
+            text = "Hast thou delivered it yet? %s is %s in %s." % (
+                q["to"], SHOP_TITLES[q["to_shop"]], t["name"])
+        self.npc_say(mob, text)
+
+    def reward(self, q):
+        p = self.p
+        p["gold"] += q["gold"]
+        p["xp"] += q["xp"]
+        self.side[q["id"]]["state"] = "done"
+        self.say("(+%d gold, +%d xp)" % (q["gold"], q["xp"]), "good")
+        self.root.after(200, self.sound.play, "quest")
+        self.save()
+
+    def finish_errand(self, mob):
+        q = self.world["side"][int(mob.quest)]
+        if q["kind"] == "hunt":
+            text = "Thou hast done it! We can sleep soundly again."
+        elif q["kind"] == "fetch":
+            text = "Thou found %s! I could hug thee. Sorry, is that too " \
+                   "much?" % q["item"]
+        else:
+            text = "%s! Oh, my sweet girl! (%s honks, and bites %s.)" % (
+                q["goose"], q["goose"], q["giver"])
+        self.npc_say(mob, text + " Here's thy reward, as promised.")
+        self.reward(q)
+
+    def deliver(self, mob):
+        q = self.world["side"][int(mob.recipient)]
+        st = self.side.get(q["id"])
+        if not st or st["state"] != "active":
+            return
+        giver_town = self.world["towns"][q["town"]]["name"]
+        self.say("You hand over %s from %s." % (q["item"], q["giver"]),
+                 "info")
+        self.npc_say(mob, "From %s in %s? How thoughtful! Here's %d gold "
+                     "for thy trouble." % (q["giver"], giver_town, q["gold"]))
+        self.reward(q)
+
+    def journal(self):
+        if self.busy or self.talk:
+            return
+        w = self.world
+        castle = w["castle"]
+        self.say("~ Journal ~", "quest")
+        di = self.current_quest()
+        if "won" in self.flags:
+            main = "Moosedain is defeated. %s is saved!" % w["realm"]
+        elif "moosedain_dead" in self.flags:
+            main = "Tell Lord Canadian that Moosedain is dead."
+        elif "final_quest" in self.flags:
+            lair = w["dungeons"][5]
+            main = "Slay Moosedain in his lair, %s of the castle." % where(
+                castle, (lair["x"], lair["y"]))
+        elif di is None:
+            main = "Bring the relics to Lord Canadian."
+        elif di in self.held:
+            main = "Bring %s back to Lord Canadian." % w["dungeons"][di][
+                "artifact"]
+        else:
+            d = w["dungeons"][di]
+            main = "Recover %s from %s, %s of the castle." % (
+                d["artifact"], d["name"], where(castle, (d["x"], d["y"])))
+        self.say("Quest: " + main, "talk")
+        active = [q for q in w["side"]
+                  if self.side.get(q["id"], {}).get("state") == "active"]
+        done = sum(v["state"] == "done" for v in self.side.values())
+        for q in active:
+            st = self.side[q["id"]]
+            town = w["towns"][q["town"]]["name"]
+            if q["kind"] == "hunt":
+                what = "slay %d %s (%d so far)" % (
+                    q["count"], plural(MONSTERS[q["monster"]].name),
+                    st["count"])
+            elif q["kind"] == "fetch":
+                d = w["dungeons"][q["dungeon"]]
+                what = "find %s in %s, level %d" % (q["item"], d["name"],
+                                                     q["level"])
+            elif q["kind"] == "goose":
+                what = "catch %s the goose, %s of %s" % (
+                    q["goose"], where((w["towns"][q["town"]]["x"],
+                                       w["towns"][q["town"]]["y"]),
+                                      q["home"]), town)
+            else:
+                what = "take %s to %s, %s in %s" % (
+                    q["item"], q["to"], SHOP_TITLES[q["to_shop"]],
+                    w["towns"][q["to_town"]]["name"])
+            ready = self.errand_ready(q["id"])
+            self.say("Errand for %s in %s: %s%s" % (
+                q["giver"], town, what,
+                " (done: return for thy reward)" if ready else ""), "talk")
+        if not active:
+            self.say("No errands under way. Townsfolk who need HELP will "
+                     "say so.", "info")
+        if done:
+            self.say("Errands completed: %d of %d." % (done, len(w["side"])),
+                     "info")
 
     # ── Shops ──
 
@@ -3654,6 +4037,11 @@ TILE_PNG = {
         "iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAASklEQVR42mNgGAW0Ad1R2v+R"
         "MUWaSTIEpFBAQOA/WYZEWUjh1EiUIf+hgCJDiNFMFUNA3oVhkg1A1ozXAHQ2LKDxakZWhM6m"
         "GQAAMVGtxTkSWtMAAAAASUVORK5CYII="
+    ),
+    "goose": (
+        "iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAAXUlEQVR42mNgGDRAQEDgPwiT"
+        "rRkEyDYE3QCyDaHIGxSHA1UNiIiIwIrxasaliWiDQBInTpwAY2TF6HwYxupVZEOwGYasGWdY"
+        "ke0FdPCsQu4/Pj5tDQApRtaAzkcGAJ8qnyyC+3RNAAAAAElFTkSuQmCC"
     ),
     "moosedain": (
         "iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAAeUlEQVR42mPojtL+D8IMUIDO"

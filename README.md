@@ -41,6 +41,7 @@ To build a macOS app with an icon:
 | C, then a number | Cast a spell (aimed spells then ask for a direction) |
 | P | Drink a healing potion |
 | M | Map of the lands you have seen |
+| J | Journal: your quest and your errands |
 | ? | Help |
 | + / − | Zoom in / out |
 | V | Sound effects on / off |
@@ -57,6 +58,12 @@ which boss holds which relic.
 **Lord Canadian** sits on his throne in Castle Canadian. Ask him about your
 QUEST. He heals you whenever you visit and raises your level once you have
 earned enough experience.
+
+**Errands.** Some townsfolk need HELP, and say so when you meet them. Ask,
+and they'll send you to slay monsters, fetch something stolen from a
+dungeon, catch a runaway goose, or carry a parcel to a shopkeeper in
+another town, for gold and experience. Each town has two errands; press J
+to see the ones you've taken on.
 
 **Classes.** Fighters are tough and strong. Mages are frail but start with
 the Frost Bolt and Heal spells and have the most magic points. Rangers are

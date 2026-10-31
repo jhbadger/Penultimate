@@ -23,7 +23,16 @@ answer BUY.  Lord Canadian heals you and raises your level when you have
 earned it.  Dying is not the end: Lord Canadian resurrects you, but your gold
 is lost.
 
+A new game starts with character creation: choose a name and a class.
+Fighters are tough, mages start with spells and the most magic, and rangers
+start with a hockey puck sling.  Outfitters sell canoes (carry one and you
+can paddle onto any water), slings and pucks; mages sell spellbooks.  Days
+pass as you play: at night you see less, more monsters prowl, and only inns
+and taverns stay open.  Islands off the coast hold inukshuks with gifts
+beneath them.
+
 Keys:  arrows / WASD   move (into monsters to fight, into people to talk)
+       F + direction   fire a hockey puck   C + number   cast a spell
        space           wait a turn        P   drink a healing potion
        M               map                ?   help
        + / -           zoom in / out      V   sound effects on / off
@@ -72,7 +81,8 @@ SAVE_FILE = os.path.expanduser("~/.penultimate.json")
 
 WALKABLE = {"grass", "forest", "hills", "swamp", "sand", "town", "castle",
             "dungeon", "lair", "stone", "cobble", "wood", "carpet", "throne",
-            "door", "dfloor", "stairs_up", "stairs_down", "chest"}
+            "door", "dfloor", "stairs_up", "stairs_down", "chest",
+            "inukshuk"}
 OPAQUE = {"world": {"forest", "mountain"}, "town": {"brick", "door"},
           "castle": {"brick", "door"}, "dungeon": {"dwall"}}
 LAND = {"grass", "forest", "hills", "swamp", "sand"}      # wilderness
@@ -81,11 +91,13 @@ DUNGEON_FLOOR = {"dfloor", "stairs_up", "stairs_down"}
 SPRITES = {"avatar", "lord", "guard", "man", "woman", "merchant", "jester",
            "rat", "bat", "snake", "slime", "wolf", "goblin", "orc",
            "skeleton", "spider", "troll", "ghost", "daemon", "dragon",
-           "serpent", "moosedain", "witch", "beaver", "hit", "bolt"}
+           "serpent", "moosedain", "witch", "beaver", "wizard", "canoe",
+           "hit", "bolt", "puck", "frost"}
 SITE_COLORS = {"town": "#ff5040", "castle": "#ffffff", "dungeon": "#ffa020",
                "lair": "#d040ff"}
 DIRS = ((0, -1), (0, 1), (-1, 0), (1, 0))
 LIGHT_RADIUS = 6
+DAY = 240                       # turns in a day: 10 per hour
 
 # ── Things ───────────────────────────────────────────────────────────────────
 
@@ -155,10 +167,49 @@ BOSS_NAMES = ["Grubnak", "Skarr", "Vorgath", "Ulmog", "Krell", "Mortis",
               "Zhaal", "Brakka", "Thessaly", "Grimbold", "Nox", "Ragnor",
               "Sludge", "Fenwick"]
 
-START_PLAYER = {"name": "Avatar", "level": 1, "hp": 30, "maxhp": 30,
-                "str": 10, "dex": 10, "xp": 0, "gold": 60, "food": 250,
-                "potions": 2, "weapon": "Dagger", "armor": "Clothes",
-                "poison": False, "beaver": False}
+START_PLAYER = {"name": "Avatar", "class": "Fighter", "level": 1, "hp": 30,
+                "maxhp": 30, "str": 10, "dex": 10, "int": 8, "mp": 6,
+                "xp": 0, "gold": 60, "food": 250, "potions": 2,
+                "weapon": "Dagger", "armor": "Clothes", "poison": False,
+                "beaver": False, "spells": [], "canoe": False,
+                "sling": False, "pucks": 0, "light": 0}
+
+# name: starting stats and gear, what each level adds, and a description
+CLASSES = {
+    "Fighter": {"hp": 36, "str": 13, "dex": 9, "int": 6, "weapon": "Club",
+                "armor": "Parka", "spells": [], "sling": False, "pucks": 0,
+                "gain": {"hp": (10, 14), "str": 2, "dex": 1, "int": 0},
+                "desc": "Tough and strong. Starts with a club and a parka."},
+    "Mage": {"hp": 24, "str": 8, "dex": 10, "int": 15, "weapon": "Dagger",
+             "armor": "Clothes", "spells": ["Frost Bolt", "Heal"],
+             "sling": False, "pucks": 0,
+             "gain": {"hp": (6, 9), "str": 0, "dex": 1, "int": 2},
+             "desc": "Frail, but knows the Frost Bolt and Heal spells, and "
+                     "has the most magic."},
+    "Ranger": {"hp": 30, "str": 10, "dex": 13, "int": 9, "weapon": "Dagger",
+               "armor": "Leather", "spells": [], "sling": True, "pucks": 25,
+               "gain": {"hp": (8, 11), "str": 1, "dex": 2, "int": 1},
+               "desc": "Quick and sure-eyed. Starts with a hockey puck sling "
+                       "and leather armour."},
+}
+
+Spell = namedtuple("Spell", "mp price aimed desc")
+SPELLS = {
+    "Heal": Spell(4, 60, False, "heals 8 + Int hit points"),
+    "Cure": Spell(2, 40, False, "cures poison"),
+    "Light": Spell(3, 50, False, "lights the dark for 150 turns"),
+    "Frost Bolt": Spell(5, 120, True, "an icy bolt: 4-10 + Int/2 damage"),
+    "Sorry": Spell(4, 100, False, "an apology so heartfelt that nearby "
+                   "monsters flee"),
+    "Portage": Spell(12, 300, False, "carries thee home to Castle Canadian"),
+}
+PUCK_DMG = (2, 6)
+PUCK_RANGE = 6
+BOLT_RANGE = 7
+
+
+def max_mp(p):
+    return max(0, p["int"] - 5) * 2 + 2 * p["level"]
 MAX_LEVEL = 10
 BEAVER_HP = 12                  # a beaver's most hit points
 BEAVER_BITE = (1, 3)            # and its damage
@@ -238,6 +289,11 @@ TIPS = [
     "Drink a healing potion when thou art hurt: press P.",
     "Lord Canadian raises thy level when thou hast gained the experience.",
     "Treasure chests lie deep in the dungeons.",
+    "Mages in the towns sell spellbooks. Press C to cast what thou knowest.",
+    "Outfitters sell canoes: carry one, and thou canst paddle the lakes and "
+    "seas. Press F to fire a hockey puck sling, if thou hast one.",
+    "The nights are dark and dangerous. Shops close at night, but inns "
+    "and taverns stay open.",
     "Beware the wood witches of the deep forests: they turn travellers "
     "into beavers! Only Lord Canadian can undo their magic.",
 ]
@@ -458,6 +514,57 @@ def try_world(seed, attempt):
     return world
 
 
+def place_inukshuks(world):
+    """Put an inukshuk on up to five islands: land cut off from the mainland
+    by water, reachable only by canoe.  Worlds with fewer than three
+    islands get small new ones raised in open water near the coast."""
+    grid = world["grid"]
+    rng = random.Random("%s:islands" % world["seed"])
+    seen = set(flood(grid, world["castle"],
+                     LAND | {"town", "castle", "dungeon", "lair"}))
+    spots = []
+    for y in range(WORLD_H):
+        for x in range(WORLD_W):
+            if grid[y][x] not in LAND or (x, y) in seen:
+                continue
+            comp = sorted(flood(grid, (x, y), LAND))
+            seen.update(comp)
+            if any(0 <= cx + dx < WORLD_W and 0 <= cy + dy < WORLD_H and
+                   grid[cy + dy][cx + dx] in WATER
+                   for cx, cy in comp for dx, dy in DIRS):
+                spots.append(rng.choice(comp))
+    rng.shuffle(spots)
+    spots = spots[:5]
+    if len(spots) < 3:
+        # distance from land, for every square
+        near = {(x, y): 0 for y in range(WORLD_H) for x in range(WORLD_W)
+                if grid[y][x] not in WATER}
+        q = deque(near)
+        while q:
+            x, y = q.popleft()
+            for dx, dy in DIRS:
+                n = (x + dx, y + dy)
+                if (n not in near and 0 <= n[0] < WORLD_W
+                        and 0 <= n[1] < WORLD_H):
+                    near[n] = near[(x, y)] + 1
+                    q.append(n)
+        sea = [p for p, d in sorted(near.items()) if 4 <= d <= 7
+               and 3 <= p[0] < WORLD_W - 3 and 3 <= p[1] < WORLD_H - 3]
+        rng.shuffle(sea)
+        for x, y in sea:
+            if len(spots) >= 3:
+                break
+            if any(abs(x - a) + abs(y - b) < 10 for a, b in spots):
+                continue
+            for dx, dy in rng.sample(DIRS, rng.randint(2, 4)):
+                grid[y + dy][x + dx] = "sand"
+            grid[y][x] = "grass"
+            spots.append((x, y))
+    world["inukshuks"] = spots
+    for x, y in world["inukshuks"]:
+        grid[y][x] = "inukshuk"
+
+
 # ── Maps and creatures ───────────────────────────────────────────────────────
 
 class Area:
@@ -503,6 +610,7 @@ class Mob:
         self.shop = None
         self.lord = False
         self.greet = ""
+        self.flee = 0               # monster: turns left running away
 
 
 def make_monster(kind, x, y):
@@ -549,6 +657,10 @@ def town_rumours(world, here):
             out.append("%s lurks in the depths of %s, guarding %s."
                        % (d["boss"], d["name"], d["artifact"]))
     out.append("Lord Canadian's castle lies %s." % where(here, world["castle"]))
+    for x, y in world.get("inukshuks", []):
+        out.append("An inukshuk stands on an island %s. Travellers leave "
+                   "gifts beneath them, they say. Thou'lt need a canoe."
+                   % where(here, (x, y)))
     for t in world["towns"]:
         if (t["x"], t["y"]) != here:
             out.append("The town of %s lies %s."
@@ -594,7 +706,8 @@ def fill(g, x0, y0, x1, y1, tile):
 
 
 SHOP_KINDS = ["weapon", "armor", "healer", "inn", "tavern"]
-SHOP_TITLES = {"weapon": "the blacksmith", "armor": "the armourer",
+SHOP_TITLES = {"outfitter": "the outfitter", "mage": "the mage",
+               "weapon": "the blacksmith", "armor": "the armourer",
                "healer": "the healer", "inn": "the innkeeper",
                "tavern": "the barkeep", "quartermaster": "the quartermaster"}
 
@@ -616,7 +729,7 @@ def make_town(world, ti):
 
     slots = [(sx, top) for sx in (2, 9, 18, 25) for top in (True, False)]
     rng.shuffle(slots)
-    kinds = SHOP_KINDS + ["house", "house"]
+    kinds = SHOP_KINDS + ["outfitter", "mage", "house"]
     for kind, (sx, top) in zip(kinds, slots):
         bw, bh = 6, rng.randint(5, 7)
         bx = sx + rng.randint(0, 1)
@@ -698,13 +811,24 @@ def shopkeeper(rng, world, kind, x, y, here):
             rng.choice(("Sleepy", "Frozen", "Snoring", "Drowsy", "Cozy")),
             rng.choice(("Moose", "Goose", "Beaver", "Loon", "Caribou")))
         job = "I keep the inn. A night's rest heals all wounds."
+    elif kind == "outfitter":
+        shop["title"] = "%s's Outfitters" % name
+        job = "I outfit travellers: canoes, slings, pucks and rations."
+    elif kind == "mage":
+        shop["title"] = "the %s Tower" % rng.choice((
+            "Aurora", "Northern Lights", "Starry", "Frostfire", "Moonlit"))
+        shop["stock"] = sorted(rng.sample(list(SPELLS), 4),
+                               key=lambda n: SPELLS[n].price)
+        job = "I study the arcane arts, and sell spellbooks to those with " \
+              "the wit to read them."
     else:
         shop["title"] = "the %s %s" % (
             rng.choice(("Tipsy", "Jolly", "Thirsty", "Rowdy", "Polite")),
             rng.choice(("Loon", "Moose", "Puck", "Canoe", "Toque")))
         job = "I run the tavern. Food for the road, and ale for gossip."
     news = rng.choice(town_rumours(world, here))
-    m = person("woman" if kind == "healer" else "merchant", SHOP_TITLES[kind],
+    m = person({"healer": "woman", "mage": "wizard"}.get(kind, "merchant"),
+               SHOP_TITLES[kind],
                name, x, y, {"job": job + " Wouldst thou BUY something?",
                             "news": news, "rumour": news, "rumor": news})
     m.shop = shop
@@ -1157,6 +1281,14 @@ class Sound:
         tone(b, 0.04, 200, 0.2, "sine", 0.1)
         noise(b, 0, 0.25, 300, 0.2)
         self.write("fire", b)
+        b = []
+        noise(b, 0, 0.09, 2500, 0.18)
+        tone(b, 0, 600, 0.06, "square", 0.05)
+        self.write("throw", b)
+        b = []
+        for i in range(6):
+            tone(b, i * 0.035, 1200 + i * 260, 0.12, "sine", 0.12)
+        self.write("spell", b)
         self.synthesize_music()
 
     def synthesize_music(self):
@@ -1271,6 +1403,9 @@ HELP = """PENULTIMATE
 Arrow keys / WASD   move; walk into monsters to fight
                     and into people to talk
 Space               wait a turn
+F + direction       fire your hockey puck sling
+C + number          cast a spell (aimed ones then
+                    ask for a direction)
 P                   drink a healing potion
 M                   map of the lands you have seen
 + / -               zoom in / out
@@ -1285,6 +1420,11 @@ Shopkeepers answer BUY; talk across their counters.
 
 Lord Canadian heals you and raises your level once you
 have enough experience. Visit him often.
+
+Outfitters sell canoes (paddle the lakes and seas),
+puck slings and pucks; mages sell spellbooks. Nights
+are dark and dangerous, and only inns and taverns stay
+open. A night at the inn takes you to the morning.
 
 Press any key to close."""
 
@@ -1378,7 +1518,9 @@ class Game:
         self.fx_token = 0
         self.overlay = None         # None, "map", "help" or "won"
         self.talk = None            # {"mob", "mode"} while in a conversation
-        self.busy = False           # dying: input is ignored
+        self.busy = False           # dying or a missile flying: no input
+        self.aim = None             # waiting for a direction to fire in
+        self.picking = False        # waiting for a spell's number
         self.visible = set()
         self.cache = {}
 
@@ -1436,13 +1578,80 @@ class Game:
 
     def setup_world(self, seed):
         self.world = generate_world(seed)
+        place_inukshuks(self.world)
         self.world_area = Area("world", ("world",), self.world["grid"],
                                self.world["realm"], "deep")
         self.cache = {}
 
-    def new_game(self):
+    def ask_hero(self):
+        """Character creation: a name and a class, or None if cancelled."""
+        root = self.root
+        dlg = tk.Toplevel(root, bg=PANEL, padx=18, pady=14)
+        dlg.title("A new hero")
+        dlg.transient(root)
+        dlg.resizable(False, False)
+        result = {}
+        tk.Label(dlg, text="Who art thou, traveller?", bg=PANEL, fg=ACCENT,
+                 font=("Helvetica", 16, "bold")).pack(anchor="w")
+        row = tk.Frame(dlg, bg=PANEL)
+        row.pack(fill="x", pady=(10, 8))
+        tk.Label(row, text="Name:", bg=PANEL, fg=INK,
+                 font=("Helvetica", 13)).pack(side="left")
+        name = tk.Entry(row, bg=LOG_BG, fg=INK, insertbackground=INK,
+                        font=MONO, width=20, highlightthickness=0)
+        name.insert(0, getattr(self, "p", START_PLAYER)["name"])
+        name.pack(side="left", padx=8)
+        cls = tk.StringVar(value="Fighter")
+        for c, info in CLASSES.items():
+            tk.Radiobutton(dlg, text=c, variable=cls, value=c, bg=PANEL,
+                           fg=INK, selectcolor=LOG_BG, activebackground=PANEL,
+                           font=("Helvetica", 13, "bold"),
+                           anchor="w").pack(fill="x")
+            tk.Label(dlg, text=info["desc"], bg=PANEL, fg=INK_DIM,
+                     wraplength=360, justify="left",
+                     font=("Helvetica", 12)).pack(fill="x", padx=(26, 0))
+
+        def begin(_=None):
+            n = " ".join(name.get().split())[:20]
+            result["hero"] = (n or "Avatar", cls.get())
+            dlg.destroy()
+        bar = tk.Frame(dlg, bg=PANEL)
+        bar.pack(fill="x", pady=(12, 0))
+        tk.Button(bar, text="Begin", command=begin, width=9,
+                  highlightbackground=PANEL).pack(side="right")
+        tk.Button(bar, text="Cancel", command=dlg.destroy, width=9,
+                  highlightbackground=PANEL).pack(side="right", padx=6)
+        dlg.bind("<Return>", begin)
+        dlg.bind("<Escape>", lambda e: dlg.destroy())
+        name.focus_set()
+        name.select_range(0, "end")
+        dlg.update_idletasks()
+        dlg.geometry("+%d+%d" % (
+            root.winfo_rootx() + max(0, (root.winfo_width() -
+                                         dlg.winfo_reqwidth()) // 2),
+            root.winfo_rooty() + 80))
+        dlg.grab_set()
+        root.wait_window(dlg)
+        return result.get("hero")
+
+    def new_game(self, hero=None):
+        if hero is None:
+            hero = self.ask_hero()
+            if hero is None:
+                if getattr(self, "p", None):
+                    return              # cancelled: keep playing this game
+                hero = ("Avatar", "Fighter")
+        name, cls = hero
+        c = CLASSES[cls]
         self.setup_world(random.randrange(1 << 31))
         self.p = dict(START_PLAYER)
+        self.p.update(name=name, maxhp=c["hp"], hp=c["hp"], weapon=c["weapon"],
+                      armor=c["armor"], spells=list(c["spells"]),
+                      sling=c["sling"], pucks=c["pucks"])
+        self.p["class"] = cls
+        for k in ("str", "dex", "int"):
+            self.p[k] = c[k]
+        self.p["mp"] = max_mp(self.p)
         self.flags, self.held, self.returned = set(), [], set()
         self.turn = 0
         cx, cy = self.world["castle"]
@@ -1455,11 +1664,13 @@ class Game:
         self.overlay = None
         self.end_talk()
         self.busy = False
+        self.aim = None
+        self.picking = False
         self.log.config(state="normal")
         self.log.delete("1.0", "end")
         self.log.config(state="disabled")
-        self.say("Welcome to %s, %s!" % (self.world["realm"],
-                                         self.p["name"]), "quest")
+        self.say("Welcome to %s, %s the %s!" % (
+            self.world["realm"], self.p["name"], cls), "quest")
         self.say("Lord Canadian's castle stands beside thee. Walk into it "
                  "and speak with His Lordship: he has a QUEST for thee.")
         self.say("Arrow keys or WASD move. Walk into people to talk and into "
@@ -1485,6 +1696,9 @@ class Game:
         self.pos = [int(v) for v in g["pos"]]
         if not self.area.inside(*self.pos):
             raise ValueError("bad position")
+        t = self.area.grid[self.pos[1]][self.pos[0]]
+        if t not in WALKABLE and not (t in WATER and self.area.kind == "world"):
+            self.pos = list(self.area.start)    # the map changed under us
         if self.p["hp"] <= 0:
             self.resurrect()
         self.say("Welcome back to %s, %s." % (self.world["realm"],
@@ -1612,8 +1826,22 @@ class Game:
                 self.overlay = None
                 self.render()
             return
+        if self.picking:
+            self.pick_spell(k)
+            return
+        if self.aim:
+            if k in MOVE_KEYS:
+                self.fire(*MOVE_KEYS[k])
+            else:
+                self.aim = None
+                self.say("Never mind.", "info")
+            return
         if k in MOVE_KEYS:
             self.move(*MOVE_KEYS[k])
+        elif k in ("f", "F"):
+            self.ready_sling()
+        elif k in ("c", "C"):
+            self.choose_spell()
         elif k in ("space", "period", "KP_5"):
             self.say("You wait.", "info")
             self.end_turn()
@@ -1665,9 +1893,20 @@ class Game:
                      "in.", "info")
             self.sound.play("bump")
             return
-        if t not in WALKABLE:
+        p = self.p
+        water = a.kind == "world" and t in WATER
+        if water and not (p["canoe"] or p["beaver"]):
+            self.say("You need a canoe to go out on the water.", "info")
+            self.sound.play("bump")
+            return
+        if t not in WALKABLE and not water:
             self.bump()
             return
+        if water and a.grid[self.pos[1]][self.pos[0]] not in WATER:
+            self.say("You swim out into the water, as beavers do."
+                     if p["beaver"] else
+                     "You set your canoe in the water and paddle off.",
+                     "info")
         self.pos = [x, y]
         site = self.world["sites"].get((x, y)) if a.kind == "world" else None
         if site:
@@ -1679,7 +1918,9 @@ class Game:
         if t == "stairs_up":
             self.change_level(-1)
             return
-        if t == "chest":
+        if t == "inukshuk":
+            self.visit_inukshuk(x, y)
+        elif t == "chest":
             self.open_chest(x, y)
         elif t == "swamp" and not self.p["poison"] and random.random() < 0.15:
             self.p["poison"] = True
@@ -1693,7 +1934,14 @@ class Game:
 
     def end_turn(self):
         p, a = self.p, self.area
+        before = self.phase()
         self.turn += 1
+        now = self.phase()
+        if now != before and a.kind != "dungeon":
+            self.say({"dawn": "Dawn breaks.", "day": "The sun is up.",
+                      "dusk": "The sun is setting.",
+                      "night": "Night falls. Beware what walks in the dark."
+                      }[now], "info")
         if a.kind == "world" or (a.kind == "dungeon" and self.turn % 2 == 0):
             if p["food"] > 0:
                 p["food"] -= 1
@@ -1712,6 +1960,12 @@ class Game:
                 self.say("The poison has worn off.", "good")
         elif p["food"] > 0 and self.turn % 6 == 0 and p["hp"] < self.max_hp():
             p["hp"] += 1
+        if self.turn % 4 == 0 and p["mp"] < max_mp(p) and not p["beaver"]:
+            p["mp"] += 1
+        if p["light"] > 0:
+            p["light"] -= 1
+            if p["light"] == 0:
+                self.say("Your magical light fades.", "info")
         if p["hp"] <= 0:
             self.die()
             return
@@ -1749,6 +2003,15 @@ class Game:
         px, py = self.pos
         dx, dy = px - mob.x, py - mob.y
         dist = abs(dx) + abs(dy)
+        if mob.flee > 0:
+            mob.flee -= 1
+            for sx, sy in sorted(DIRS, key=lambda d: -abs(px - mob.x - d[0])
+                                 - abs(py - mob.y - d[1]))[:2]:
+                if self.can_go(mob, mob.x + sx, mob.y + sy):
+                    mob.x += sx
+                    mob.y += sy
+                    break
+            return
         if dist == 1:
             self.monster_attack(mob)
             return
@@ -1792,7 +2055,8 @@ class Game:
         a = self.area
         px, py = self.pos
         a.mobs = [m for m in a.mobs if abs(m.x - px) + abs(m.y - py) <= 24]
-        if len(a.mobs) >= 6 or random.random() > 0.07:
+        night = self.phase() == "night"
+        if len(a.mobs) >= 6 or random.random() > (0.12 if night else 0.07):
             return
         for _ in range(10):
             ang = random.random() * 2 * math.pi
@@ -1802,7 +2066,8 @@ class Game:
                 continue
             t = a.grid[y][x]
             cx, cy = self.world["castle"]
-            danger = min(6, 1 + int(math.hypot(x - cx, y - cy) // 8))
+            danger = min(6, 1 + night +
+                         int(math.hypot(x - cx, y - cy) // 8))
             if t == "deep" and random.random() < 0.3:
                 kind = "serpent"
             elif t == "forest" and danger >= 2 and random.random() < 0.25:
@@ -1854,6 +2119,10 @@ class Game:
                                           self.the(mob), dmg))
             self.sound.play("hit")
             return
+        self.kill(mob)
+
+    def kill(self, mob):
+        p = self.p
         self.area.mobs.remove(mob)
         gold = random.randint(0, mob.xp // 2 + 1)
         if mob.boss:
@@ -1939,6 +2208,7 @@ class Game:
         p["hp"] = p["maxhp"]
         p["poison"] = False
         p["beaver"] = False         # Lord Canadian sees to that, too
+        p["mp"] = max_mp(p)
         p["gold"] = 0
         p["food"] = max(p["food"], 100)
         self.cache = {k: v for k, v in self.cache.items()
@@ -1969,6 +2239,197 @@ class Game:
             self.p["potions"] += 1
             msg += " and a healing potion"
         self.say(msg + "!", "gold")
+        self.sound.play("gold")
+
+    # ── Magic and missiles ──
+
+    def choose_spell(self):
+        if self.busy or self.talk or self.overlay:
+            return
+        p = self.p
+        if p["beaver"]:
+            self.say("You chitter the magic words, but beavers can't cast "
+                     "spells.", "info")
+            return
+        if not p["spells"]:
+            self.say("You know no spells. The mages in the towns sell "
+                     "spellbooks.", "info")
+            return
+        self.say("Cast which spell? (you have %d MP)" % p["mp"], "info")
+        for i, n in enumerate(p["spells"], 1):
+            self.say("   %d) %-10s %2d MP  %s" % (i, n, SPELLS[n].mp,
+                                                 SPELLS[n].desc), "talk")
+        self.say("   (press its number, or Escape)", "info")
+        self.picking = True
+
+    def pick_spell(self, k):
+        self.picking = False
+        k = k[3:] if k.startswith("KP_") else k
+        spells = self.p["spells"]
+        if k.isdigit() and 1 <= int(k) <= len(spells):
+            self.cast(spells[int(k) - 1])
+        else:
+            self.say("Never mind.", "info")
+
+    def cast(self, name):
+        p, a = self.p, self.area
+        sp = SPELLS[name]
+        if p["mp"] < sp.mp:
+            self.say("You haven't the magic for %s (%d MP)." % (name, sp.mp),
+                     "info")
+            return
+        if name == "Cure" and not p["poison"]:
+            self.say("You are not poisoned.", "info")
+            return
+        if name == "Portage" and a.kind == "castle":
+            self.say("You are already at Castle Canadian.", "info")
+            return
+        if sp.aimed:
+            self.aim = {"spell": name}
+            self.say("Cast %s in which direction?" % name, "info")
+            return
+        p["mp"] -= sp.mp
+        self.sound.play("spell")
+        if name == "Heal":
+            heal = min(self.max_hp() - p["hp"], 8 + p["int"])
+            p["hp"] += heal
+            self.say("Warmth flows through you. (+%d)" % heal, "good")
+        elif name == "Cure":
+            p["poison"] = False
+            self.say("The poison leaves your blood.", "good")
+        elif name == "Light":
+            p["light"] = 150
+            self.say("A soft, magical glow surrounds you.", "good")
+        elif name == "Sorry":
+            px, py = self.pos
+            fled = [m for m in a.mobs if m.hostile and not m.boss
+                    and abs(m.x - px) + abs(m.y - py) <= 5]
+            for m in fled:
+                m.flee = 8
+            if fled:
+                self.say("\"Sorry! So sorry! Terribly sorry!\" Touched by "
+                         "your apology, %s %s off." % (
+                             ", ".join(self.the(m) for m in fled),
+                             "runs" if len(fled) == 1 else "run"), "good")
+            else:
+                self.say("You apologise to no one in particular. It feels "
+                         "nice, anyway.", "info")
+        elif name == "Portage":
+            self.say("You hoist your pack, take a deep breath... and find "
+                     "yourself at the gates of Castle Canadian.", "quest")
+            self.cache = {k: v for k, v in self.cache.items()
+                          if k[0] != "dungeon"}
+            self.world_pos = list(self.world["castle"])
+            self.enter(self.get_area(("castle",)), (16, 21), "spell")
+            return
+        self.end_turn()
+
+    def ready_sling(self):
+        if self.busy or self.talk or self.overlay:
+            return
+        p = self.p
+        if p["beaver"]:
+            self.say("Your little paws can't work a sling.", "info")
+        elif not p["sling"]:
+            self.say("You have no sling. Outfitters sell them.", "info")
+        elif p["pucks"] <= 0:
+            self.say("You are out of hockey pucks!", "info")
+        else:
+            self.aim = {"puck": True}
+            self.say("Fire a puck in which direction?", "info")
+
+    def fire(self, dx, dy):
+        p, a = self.p, self.area
+        aim, self.aim = self.aim, None
+        if "spell" in aim:
+            p["mp"] -= SPELLS[aim["spell"]].mp
+            self.sound.play("spell")
+            tile, reach = "frost", BOLT_RANGE
+            dmg = random.randint(4, 10) + p["int"] // 2
+            skill = p["int"] // 3
+        else:
+            p["pucks"] -= 1
+            self.sound.play("throw")
+            tile, reach = "puck", PUCK_RANGE
+            dmg = max(1, random.randint(*PUCK_DMG) + (p["dex"] - 10) // 2)
+            skill = p["dex"] // 3
+        path, (x, y) = [], self.pos
+        for _ in range(reach):
+            x, y = x + dx, y + dy
+            if not a.inside(x, y):
+                break
+            t = a.grid[y][x]
+            if t in a.opaque or (t not in WALKABLE and t not in WATER):
+                break
+            path.append((x, y))
+            if a.mob_at(x, y):
+                break
+        target = a.mob_at(*path[-1]) if path else None
+        self.busy = True
+        self.fly(path, tile, lambda: self.missile_hit(target, tile, dmg,
+                                                        skill))
+
+    def fly(self, path, tile, done):
+        """Animate a missile along path, then call done."""
+        cols, rows, ox, oy, ts = self.view
+        c = self.canvas
+        if not path:
+            c.itemconfig(self.missile, state="hidden")
+            done()
+            return
+        x, y = path[0]
+        i, j = x - self.pos[0] + cols // 2, y - self.pos[1] + rows // 2
+        c.coords(self.missile, ox + i * ts, oy + j * ts)
+        c.itemconfig(self.missile, image=self.img[tile], state="normal")
+        c.tag_raise(self.missile)
+        self.root.after(35, self.fly, path[1:], tile, done)
+
+    def missile_hit(self, mob, tile, dmg, skill):
+        self.busy = False
+        what = "puck" if tile == "puck" else "bolt of frost"
+        if mob is None:
+            self.say("The %s %s." % (what, "clatters away" if tile == "puck"
+                                     else "fizzles out"), "info")
+        elif not mob.hostile:
+            self.say("The %s bounces off %s. \"Ow! Sorry!\"" % (
+                what, mob.title), "info")
+        elif random.randint(1, 20) + self.p["level"] + skill < \
+                10 + mob.defense:
+            self.say("The %s misses %s." % (what, self.the(mob)), "info")
+        elif mob.kind == "moosedain":
+            self.flash(mob.x, mob.y)
+            self.say("The %s glances off Moosedain's enchanted hide!" % what,
+                     "bad")
+        else:
+            self.flash(mob.x, mob.y)
+            mob.hp -= dmg
+            if mob.hp > 0:
+                self.say("The %s hits %s. (%d)" % (what, self.the(mob), dmg))
+                self.sound.play("hit")
+            else:
+                self.kill(mob)
+        self.end_turn()
+
+    def visit_inukshuk(self, x, y):
+        key = "inuk:%d,%d" % (x, y)
+        if key in self.flags:
+            self.say("The inukshuk stands silent, pointing the way home.",
+                     "info")
+            return
+        self.flags.add(key)
+        p = self.p
+        rng = random.Random("%s:%s" % (self.world["seed"], key))
+        gold = rng.randint(60, 160)
+        p["gold"] += gold
+        p["potions"] += 1
+        p["xp"] += 40
+        extra = ""
+        if p["sling"]:
+            p["pucks"] += 10
+            extra = ", ten hockey pucks"
+        self.say("An inukshuk stands here, built by travellers long ago. "
+                 "Beneath its stones you find %d gold%s and a healing "
+                 "potion. (+40 xp)" % (gold, extra), "gold")
         self.sound.play("gold")
 
     def drink(self):
@@ -2009,7 +2470,8 @@ class Game:
                 self.end_talk()
             return
         self.say("You meet %s." % mob.title, "info")
-        self.npc_say(mob, mob.greet)
+        self.npc_say(mob, "Oh! We're closed for the night, sorry. Come back "
+                     "in the morning." if self.closed(mob) else mob.greet)
         if "talked" not in self.flags:
             self.flags.add("talked")
             self.say("(Type a word such as NAME, JOB or NEWS and press "
@@ -2032,6 +2494,11 @@ class Game:
                 line = line % self.world["realm"]
         self.npc_say(mob, line)
         self.render()
+
+    def closed(self, mob):
+        """Shops close at night, except inns and taverns."""
+        return (mob.shop is not None and self.phase() == "night"
+                and mob.shop["kind"] not in ("inn", "tavern"))
 
     def end_talk(self):
         self.talk = None
@@ -2070,6 +2537,10 @@ class Game:
         if mob.lord:
             reply = self.lord_reply(w)
         elif mob.shop and w[:3] in ("buy", "pur", "sho", "war", "goo"):
+            if self.closed(mob):
+                self.npc_say(mob, "Sorry, we're closed for the night. Come "
+                             "back in the morning, eh!")
+                return
             self.list_offers(mob)
             return
         else:
@@ -2102,6 +2573,14 @@ class Game:
         if s["kind"] == "tavern":
             return [("Rations (50 meals)", 15, "food", None),
                     ("A mug of ale", 2, "ale", None)]
+        if s["kind"] == "outfitter":
+            return [("Canoe", 100, "canoe", None),
+                    ("Hockey puck sling", 40, "sling", None),
+                    ("20 hockey pucks", 10, "pucks", None),
+                    ("Rations (50 meals)", 15, "food", None)]
+        if s["kind"] == "mage":
+            return [("Spellbook: %s (%d MP)" % (n, SPELLS[n].mp),
+                     SPELLS[n].price, "spell", n) for n in s["stock"]]
         return [("Rations (50 meals)", 18, "food", None),
                 ("Healing potion", 30, "potion", None)]
 
@@ -2126,6 +2605,12 @@ class Game:
             return
         if kind == "armor" and ARMOURS[arg].price <= ARMOURS[p["armor"]].price:
             self.npc_say(mob, "That's no better than thy %s!" % p["armor"])
+            return
+        if kind in ("canoe", "sling") and p[kind]:
+            self.npc_say(mob, "Thou hast one already!")
+            return
+        if kind == "spell" and arg in p["spells"]:
+            self.npc_say(mob, "Thou knowest that spell already.")
             return
         if kind == "cure" and not p["poison"]:
             self.npc_say(mob, "Thou art not poisoned. Lucky thee!")
@@ -2167,7 +2652,28 @@ class Game:
             self.npc_say(mob, "Thy wounds are healed." if kind == "heal" else
                          "Thou sleepest soundly, and wakest refreshed.")
             if kind == "room":
-                self.turn += 100
+                p["mp"] = max_mp(p)
+                h = self.turn * 24 // DAY + 8          # sleep till 8 am
+                h = (h // 24 + (h % 24 >= 8)) * 24 + 8
+                self.turn = (h - 8) * DAY // 24
+                self.say("It is morning, day %d." % self.clock()[0], "info")
+        elif kind == "canoe":
+            p["canoe"] = True
+            self.npc_say(mob, "A fine cedar canoe! Carry it on thy back, and "
+                         "paddle out wherever there's water. Portage, we "
+                         "call it.")
+        elif kind == "sling":
+            p["sling"] = True
+            p["pucks"] += 10
+            self.npc_say(mob, "Here's a sling, and ten pucks to start. Press "
+                         "F to fire.")
+        elif kind == "pucks":
+            p["pucks"] += 20
+            self.npc_say(mob, "Twenty pucks. Keep thy head up!")
+        elif kind == "spell":
+            p["spells"].append(arg)
+            self.npc_say(mob, "The %s spell: study it well. Press C to cast."
+                         % arg)
         elif kind == "food":
             p["food"] += 50
             self.npc_say(mob, "Fifty meals of rations. Don't eat them all at "
@@ -2211,19 +2717,21 @@ class Game:
             self.say("(+%d xp, +%d gold)" % (xp, gold), "good")
             self.sound.play("quest")
         raised = False
+        g = CLASSES.get(p["class"], CLASSES["Fighter"])["gain"]
         while p["level"] < MAX_LEVEL and p["xp"] >= xp_needed(p["level"]):
             p["level"] += 1
-            gain = random.randint(8, 12)
+            gain = random.randint(*g["hp"])
             p["maxhp"] += gain
-            p["str"] += random.randint(1, 2)
-            p["dex"] += random.randint(1, 2)
+            for k in ("str", "dex", "int"):
+                p[k] += g[k] + random.randint(0, 1)
             raised = True
             self.say("Thou art now level %d! (+%d max HP)" % (p["level"],
                                                               gain), "quest")
         if raised:
             self.root.after(300, self.sound.play, "level")
-        if p["hp"] < p["maxhp"] or p["poison"]:
+        if p["hp"] < p["maxhp"] or p["poison"] or p["mp"] < max_mp(p):
             p["hp"] = p["maxhp"]
+            p["mp"] = max_mp(p)
             p["poison"] = False
             self.say("Lord Canadian lays his hands upon thee. Thy wounds "
                      "are healed.", "good")
@@ -2340,6 +2848,7 @@ class Game:
                     c.create_image(x, y, anchor="nw", state="hidden")))
         self.shown = [(None, None)] * len(self.cells)
         self.fx = c.create_image(0, 0, anchor="nw", state="hidden")
+        self.missile = c.create_image(0, 0, anchor="nw", state="hidden")
         self.render()
 
     @staticmethod
@@ -2361,11 +2870,35 @@ class Game:
                 y += sy
         return True
 
+    def clock(self):
+        """(day, hour): day 1 begins at 8 am on turn 0."""
+        h = self.turn * 24 // DAY + 8
+        return h // 24 + 1, h % 24
+
+    def phase(self):
+        h = self.clock()[1]
+        return ("night" if h >= 21 or h < 5 else "dawn" if h < 7 else
+                "dusk" if h >= 19 else "day")
+
+    def light_radius(self):
+        """How far you can see, or None for as far as the view goes."""
+        a = self.area
+        bonus = 3 if self.p["light"] > 0 else 0
+        if a.dark:
+            return LIGHT_RADIUS + bonus
+        ph = self.phase()
+        if ph == "day":
+            return None
+        if a.kind == "world":
+            return (4 if ph == "night" else 8) + bonus
+        return (6 if ph == "night" else 10) + bonus
+
     def compute_visible(self):
         a = self.area
         cols, rows = self.view[0], self.view[1]
         px, py = self.pos
-        r2 = LIGHT_RADIUS ** 2 if a.dark else None
+        r = self.light_radius()
+        r2 = r * r if r else None
         vis = set()
         for y in range(max(0, py - rows // 2), min(a.h, py + rows // 2 + 1)):
             for x in range(max(0, px - cols // 2),
@@ -2402,7 +2935,8 @@ class Game:
                 elif a.edge:
                     base = a.edge
                 if x == px and y == py:
-                    top = "beaver" if self.p["beaver"] else "avatar"
+                    top = ("beaver" if self.p["beaver"] else "canoe"
+                           if a.grid[y][x] in WATER else "avatar")
                 idx = j * cols + i
                 old = self.shown[idx]
                 if old == (base, top):
@@ -2499,14 +3033,17 @@ class Game:
     def render_chrome(self):
         p = self.p
         self.status.config(text=cap(self.area.name))
-        self.turns.config(text="Turn %d" % self.turn)
+        day, hour = self.clock()
+        self.turns.config(text="Day %d, %d %s (%s)" % (
+            day, (hour - 1) % 12 + 1, "am" if hour < 12 else "pm",
+            self.phase()))
         need = ("%d" % xp_needed(p["level"]) if p["level"] < MAX_LEVEL
                 else "max")
-        lines = [p["name"], "",
+        lines = [p["name"], "the " + p["class"], "",
                  "Level   %d" % p["level"],
                  "HP      %d/%d" % (max(0, p["hp"]), self.max_hp()),
-                 "Str     %d" % p["str"],
-                 "Dex     %d" % p["dex"],
+                 "MP      %d/%d" % (p["mp"], max_mp(p)),
+                 "Str %d  Dex %d  Int %d" % (p["str"], p["dex"], p["int"]),
                  "XP      %d/%s" % (p["xp"], need),
                  "Gold    %d" % p["gold"],
                  "Food    %d" % p["food"],
@@ -2515,9 +3052,14 @@ class Game:
                      ("Teeth",) + BEAVER_BITE if p["beaver"] else
                      (p["weapon"],) + WEAPONS[p["weapon"]].dmg),
                  "Armour", "  %s (AC %d)" % (
-                     "Fur" if p["beaver"] else p["armor"], self.armour_ac()),
-                 "",
-                 "Relics  %d/4" % len(self.returned)]
+                     "Fur" if p["beaver"] else p["armor"], self.armour_ac())]
+        gear = (["Canoe"] if p["canoe"] else []) + (
+            ["Sling, %d pucks" % p["pucks"]] if p["sling"] else [])
+        if gear:
+            lines += ["Gear"] + ["  " + g for g in gear]
+        if p["spells"]:
+            lines += ["Spells"] + ["  " + n for n in p["spells"]]
+        lines += ["", "Relics  %d/4" % len(self.returned)]
         for di in self.world["quests"]:
             d = self.world["dungeons"][di]
             mark = ("+" if di in self.returned else
@@ -2531,6 +3073,8 @@ class Game:
         cond = []
         if p["beaver"]:
             cond.append("BEAVER")
+        if p["light"] > 0:
+            cond.append("GLOWING")
         if p["poison"]:
             cond.append("POISONED")
         if p["food"] <= 0:
@@ -2944,6 +3488,23 @@ TILE_PNG = {
         "lwvQDcAZBiS5gOIwwOYFmG3ImCQDyEoH5GB4GGBL+8jJFZs8DDPgyijItuA1AFkC2SBkA2Di"
         "2AxhwGYqcg7Fla1h4gC9B5v2RflC6gAAAABJRU5ErkJggg=="
     ),
+    "sign_outfitter": (
+        "iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAAhElEQVR42mN4dK7n/5F1GWAM"
+        "YsMwNj42MQYQEWUhRRZGMWBHgwdJGG4AyCnkGgDSi9eA7ihtOhiAHgbIbHQD0NVhDQNCIU+U"
+        "F0B8kO3IGJsarF4gORaolg7IwfAwwJb2kZMrNnkYZsCVUZBtwWsAsgSyQcgGwMSxGcKAzVTk"
+        "HIorW8PEAURDfi/lADI6AAAAAElFTkSuQmCC"
+    ),
+    "sign_mage": (
+        "iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAAhUlEQVR42mN4dK7n/5F1GWAM"
+        "YsMwNj42MQYQEWUhRRZGMWBHgwdJGG4AyCm4DHhx1B2vASC9tDEApBEd4zQAVxjg00xUGMA0"
+        "4jMArxcIhQVBLxATjRQbgBIG5GB4GGBL+8jJFZs8DDPgyijItuA1AFkC2SBkA2Di2AxhwGYq"
+        "cg7Fla1h4gBvpZGH7mFXqwAAAABJRU5ErkJggg=="
+    ),
+    "inukshuk": (
+        "iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAAXUlEQVR42mOw6rf6TwlmwCUR"
+        "ERGBgkk2oKur6/+JEyfAmCwDSHYBugZCGMMAZCcTwlgNoNgF+PyPLxwYCMUAoZigvguwacBn"
+        "CAMu5yMrxiY2SF2AK9DwBSYDpdkZANXyImMT/JlPAAAAAElFTkSuQmCC"
+    ),
     "dwall": (
         "iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAASUlEQVR42mOIiIj4jwtraaj9"
         "7+rqwivPAGKAFKFjmAJC8tQxAJ8TCckzgAhKMAOpgYYuz0Cqn9HlKTeA1EBDF6NuII6mxAFK"
@@ -3099,6 +3660,26 @@ TILE_PNG = {
         "xyWOwodxcGlG14RVHSFDiLUErjDKQgoFE9SIDtANYCAFgDScMNKAa4axybadbFfg0vziqPt/"
         "ogwQEBAAY3QDVrTJ4zYgz2HVf3wYFlNkaYZhnAaAnEqRC2B+xacZrwEDHwbEGoCsBwCCFgmv"
         "gEidFwAAAABJRU5ErkJggg=="
+    ),
+    "canoe": (
+        "iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAAY0lEQVR42mNgGL4gykLqPzKm"
+        "SDPJhoAUfzgwAQWTZABIg4CAAFwzjE2SN9BdgC7fHaWN3UCNqH3/8WG8mkE2ETIApIYiAzA0"
+        "72jw+I8r2ghhkF64ISCTScFwzcguIQUPnjwDAOtm3TYXd2OyAAAAAElFTkSuQmCC"
+    ),
+    "wizard": (
+        "iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAAfElEQVR42mNgwAM0ovb9ZyAX"
+        "gDS/OOr+nyxDQJrQMdkayTLow4EJ/9Exsnze0g/4DRIQEIBrRGYjG4DXkP9YALJ8d5Q2Ya/g"
+        "0kzQAGICEKcBxMQCCOM0ABRQMEWwRESSC2jiBXSXUBwGOA0gNgDxBiIIRFlI/QdhQmIwAADp"
+        "qxZLRhdirwAAAABJRU5ErkJggg=="
+    ),
+    "puck": (
+        "iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAAKElEQVR42mNgGAWDFAgICPzH"
+        "honWrKWhhhUTZQgu20l2BdmaR8EAAADXXCLVfZnvjwAAAABJRU5ErkJggg=="
+    ),
+    "frost": (
+        "iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAANElEQVR42mNgGJ4gb+mH/8iY"
+        "LM0wQJJB6JqRAVGG4NIMM4AoF1BsAEVeoDgQqRKNo4B0AAAg/cHVG9LgCwAAAABJRU5ErkJg"
+        "gg=="
     ),
     "hit": (
         "iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAAPElEQVR42mNgoCV4cdT9P0Ua"

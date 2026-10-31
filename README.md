@@ -10,8 +10,10 @@ Moosedain the Wicked, a sorcerer with the head of a moose, has sent his
 minions to steal four royal relics. Recover them, and Lord Canadian will
 forge the Maple Blade, the one weapon that can harm Moosedain himself.
 
-Every new game generates a new world: the map, towns, people, shops,
-dungeons, bosses and quests. Within a game, the world stays the same.
+Every new game begins with character creation (a name, and a class:
+fighter, mage or ranger) and generates a new world: the map, towns, people,
+shops, dungeons, bosses and quests. Within a game, the world stays the
+same.
 
 ## Running
 
@@ -35,6 +37,8 @@ To build a macOS app with an icon:
 | --- | --- |
 | Arrow keys / WASD | Move. Walk into monsters to fight and into people to talk |
 | Space | Wait a turn |
+| F, then a direction | Fire a hockey puck from your sling |
+| C, then a number | Cast a spell (aimed spells then ask for a direction) |
 | P | Drink a healing potion |
 | M | Map of the lands you have seen |
 | ? | Help |
@@ -53,6 +57,28 @@ which boss holds which relic.
 **Lord Canadian** sits on his throne in Castle Canadian. Ask him about your
 QUEST. He heals you whenever you visit and raises your level once you have
 earned enough experience.
+
+**Classes.** Fighters are tough and strong. Mages are frail but start with
+the Frost Bolt and Heal spells and have the most magic points. Rangers are
+quick and start with a hockey puck sling and leather armour.
+
+**Shops.** Every town has a blacksmith, armourer, healer, inn, tavern,
+outfitter and mage. Outfitters sell canoes, puck slings, pucks and
+rations; mages sell spellbooks: Heal, Cure, Light, Frost Bolt, Sorry (an
+apology so heartfelt that monsters run away) and Portage (back to the
+castle).
+
+**Canoes.** Carry a canoe and you can paddle onto any lake or sea (sea
+serpents permitting). Islands off the coast hold inukshuks with gifts
+beneath them.
+
+**Day and night.** Time passes as you play. At night you can't see as far,
+more and fiercer monsters roam, and only inns and taverns stay open. A
+night at the inn wakes you at 8 am. The Light spell helps in the dark.
+
+**Wood witches** lurk in the forests and can turn you into a beaver: few
+hit points, only a bite to fight with, and no one understands you. Only
+Lord Canadian can turn you back.
 
 **Survival.** You eat as you travel, so buy rations at taverns. Swamps can
 poison you; healers and potions cure it. Monsters get tougher the farther

@@ -52,6 +52,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import tkinter as tk
 import wave
 import zlib
@@ -1009,6 +1010,7 @@ class Sound:
         self.tune = None            # the tune that should be playing
         self.music_proc = None
         self.music_playing = None
+        self.music_deadline = 0     # when the playing loop should be over
         self.player = None
         for cmd in (["afplay"], ["paplay"], ["aplay", "-q"]):
             if shutil.which(cmd[0]):
@@ -1016,6 +1018,7 @@ class Sound:
                 break
         self.files = {}
         self.tunes = {}
+        self.lengths = {}           # tune file: seconds
         self.procs = []             # effects still playing
         if self.player:
             atexit.register(self.stop_music)
@@ -1151,6 +1154,8 @@ class Sound:
                     os.replace(tmp, path)
                 except OSError:
                     path = self.write("music-" + name, render_tune(tune))
+            with wave.open(path) as w:
+                self.lengths[path] = w.getnframes() / w.getframerate()
             self.tunes[name] = path
 
     # Music loops by restarting the player whenever it finishes; tick() is
@@ -1159,6 +1164,10 @@ class Sound:
     def tick(self):
         want = None if self.music_off else self.tunes.get(self.tune)
         proc = self.music_proc
+        if proc and proc.poll() is None and time.monotonic() > \
+                self.music_deadline:
+            self.stop_music()       # a stuck player: start it over
+            proc = None
         if want == self.music_playing and proc and proc.poll() is None:
             return
         if want != self.music_playing or (proc and proc.poll() is not None):
@@ -1169,6 +1178,8 @@ class Sound:
                     self.player + [want], stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL)
                 self.music_playing = want
+                self.music_deadline = (time.monotonic() +
+                                       self.lengths.get(want, 60) + 5)
             except OSError:
                 self.music_off = True
 

@@ -1,0 +1,2758 @@
+#!/usr/bin/env python3
+"""penultimate - a tile-based fantasy role-playing game in Python + Tk.
+
+Standard library only.  In the spirit of Ultima I-IV: one adventurer wanders
+an overworld of towns, dungeons and wilderness, talks to townsfolk, buys
+weapons and armour, and runs errands for Lord Canadian, the kindly (and
+endlessly apologetic) ruler of the realm.  Moosedain the Wicked has sent his
+minions to steal four royal relics; recover them, and Lord Canadian will
+forge the Maple Blade, the one weapon that can harm Moosedain himself.
+
+Every new game generates a new world (map, towns, people, dungeons, quests);
+within a game the world is fixed.  The game is saved to ~/.penultimate.json
+whenever you change location and when you quit, and resumed next time.
+
+Talking: walk into a person (or into a shop counter with someone behind it),
+then type a word and press Return.  Everyone knows NAME, JOB and BYE; most
+people know NEWS, and words in CAPITALS are worth asking about.  Shopkeepers
+answer BUY.  Lord Canadian heals you and raises your level when you have
+earned it.  Dying is not the end: Lord Canadian resurrects you, but your gold
+is lost.
+
+Keys:  arrows / WASD   move (into monsters to fight, into people to talk)
+       space           wait a turn        P   drink a healing potion
+       M               map                ?   help
+       + / -           zoom in / out      V   sound on / off
+       N               new game           Ctrl-Q / Cmd-Q   quit
+
+Sound effects are synthesized at startup and played with afplay (macOS),
+paplay or aplay if one is available; otherwise the game is silent.
+
+App bundle (macOS):  penultimate --build-app [DIR]   builds penultimate.app
+                     penultimate --icon-png SIZE [OUT.png]
+
+The tile graphics are PNGs stored in this file (TILE_PNG); their pixel-art
+source is make_tiles.py, which regenerates that block.
+"""
+
+import array
+import atexit
+import base64
+import json
+import math
+import os
+import plistlib
+import random
+import shutil
+import struct
+import subprocess
+import sys
+import tempfile
+import threading
+import tkinter as tk
+import wave
+import zlib
+from collections import namedtuple, deque
+from tkinter import messagebox
+
+SAVE_FILE = os.path.expanduser("~/.penultimate.json")
+
+# ── Terrain ──────────────────────────────────────────────────────────────────
+#
+# A map is a list of rows of tile names; the names are also the keys of
+# TILE_PNG.  People, monsters and effects are drawn over the terrain.
+
+WALKABLE = {"grass", "forest", "hills", "swamp", "sand", "town", "castle",
+            "dungeon", "lair", "stone", "cobble", "wood", "carpet", "throne",
+            "door", "dfloor", "stairs_up", "stairs_down", "chest"}
+OPAQUE = {"world": {"forest", "mountain"}, "town": {"brick", "door"},
+          "castle": {"brick", "door"}, "dungeon": {"dwall"}}
+LAND = {"grass", "forest", "hills", "swamp", "sand"}      # wilderness
+WATER = {"deep", "water"}
+DUNGEON_FLOOR = {"dfloor", "stairs_up", "stairs_down"}
+SPRITES = {"avatar", "lord", "guard", "man", "woman", "merchant", "jester",
+           "rat", "bat", "snake", "slime", "wolf", "goblin", "orc",
+           "skeleton", "spider", "troll", "ghost", "daemon", "dragon",
+           "serpent", "moosedain", "hit", "bolt"}
+SITE_COLORS = {"town": "#ff5040", "castle": "#ffffff", "dungeon": "#ffa020",
+               "lair": "#d040ff"}
+DIRS = ((0, -1), (0, 1), (-1, 0), (1, 0))
+LIGHT_RADIUS = 6
+
+# ── Things ───────────────────────────────────────────────────────────────────
+
+Weapon = namedtuple("Weapon", "dmg price")
+Armour = namedtuple("Armour", "ac price")
+
+WEAPONS = {
+    "Fists": Weapon((1, 2), 0),
+    "Dagger": Weapon((1, 4), 10),
+    "Club": Weapon((2, 5), 30),
+    "Mace": Weapon((2, 7), 70),
+    "Axe": Weapon((3, 8), 140),
+    "Sword": Weapon((3, 10), 260),
+    "Hockey Stick": Weapon((4, 12), 420),
+    "Great Sword": Weapon((5, 14), 700),
+    "Maple Blade": Weapon((8, 20), 2000),      # Lord Canadian's gift
+}
+SHOP_WEAPONS = ["Dagger", "Club", "Mace", "Axe", "Sword", "Hockey Stick",
+                "Great Sword"]
+
+ARMOURS = {
+    "Clothes": Armour(0, 0),
+    "Parka": Armour(1, 15),
+    "Leather": Armour(2, 40),
+    "Chain Mail": Armour(4, 150),
+    "Plate Mail": Armour(6, 420),
+    "Mithril": Armour(8, 950),
+}
+SHOP_ARMOURS = ["Parka", "Leather", "Chain Mail", "Plate Mail", "Mithril"]
+
+Monster = namedtuple("Monster",
+                     "name tile tier hp dmg defense xp habitat traits")
+
+MONSTERS = {
+    "rat": Monster("giant rat", "rat", 1, 4, (1, 3), 0, 3, "both", ""),
+    "bat": Monster("giant bat", "bat", 1, 5, (1, 3), 1, 4, "dungeon",
+                   "erratic"),
+    "snake": Monster("snake", "snake", 1, 7, (1, 4), 0, 6, "world", "poison"),
+    "slime": Monster("slime", "slime", 1, 10, (1, 4), 0, 6, "dungeon", "slow"),
+    "goblin": Monster("goblin", "goblin", 1, 9, (2, 5), 1, 9, "both", ""),
+    "wolf": Monster("wolf", "wolf", 2, 13, (2, 6), 1, 12, "world", ""),
+    "orc": Monster("orc", "orc", 2, 16, (2, 7), 2, 16, "both", ""),
+    "spider": Monster("giant spider", "spider", 3, 15, (2, 6), 2, 18, "both",
+                      "poison"),
+    "skeleton": Monster("skeleton", "skeleton", 3, 20, (3, 8), 3, 22,
+                        "dungeon", ""),
+    "serpent": Monster("sea serpent", "serpent", 3, 28, (3, 10), 2, 30,
+                       "water", ""),
+    "troll": Monster("troll", "troll", 4, 34, (4, 10), 3, 40, "both", ""),
+    "ghost": Monster("ghost", "ghost", 4, 24, (3, 9), 5, 45, "dungeon", ""),
+    "daemon": Monster("daemon", "daemon", 5, 45, (5, 13), 5, 80, "both",
+                      "ranged"),
+    "dragon": Monster("dragon", "dragon", 6, 80, (7, 18), 6, 180, "both",
+                      "ranged"),
+    "moosedain": Monster("Moosedain", "moosedain", 8, 180, (8, 20), 7, 1000,
+                         "none", "ranged"),
+}
+BOSS_TYPES = (("orc", "goblin"), ("spider", "skeleton"), ("troll", "ghost"),
+              ("daemon", "dragon"))
+BOSS_TITLES = {"orc": "the Orc Warlord", "goblin": "the Goblin King",
+               "spider": "the Spider Queen", "skeleton": "the Bone Lord",
+               "troll": "the Troll Chieftain", "ghost": "the Wailing Wraith",
+               "daemon": "the Pit Fiend", "dragon": "the Elder Wyrm"}
+BOSS_NAMES = ["Grubnak", "Skarr", "Vorgath", "Ulmog", "Krell", "Mortis",
+              "Zhaal", "Brakka", "Thessaly", "Grimbold", "Nox", "Ragnor",
+              "Sludge", "Fenwick"]
+
+START_PLAYER = {"name": "Avatar", "level": 1, "hp": 30, "maxhp": 30,
+                "str": 10, "dex": 10, "xp": 0, "gold": 60, "food": 250,
+                "potions": 2, "weapon": "Dagger", "armor": "Clothes",
+                "poison": False}
+MAX_LEVEL = 10
+
+
+def xp_needed(level):
+    """Experience needed to reach the level after this one."""
+    return 30 * level * (level + 1)
+
+
+# ── Names and words ──────────────────────────────────────────────────────────
+
+REALMS = ["Tundria", "Borealia", "Mapleland", "Frostmarch", "Loonshire"]
+TOWN_PRE = ["Tor", "Van", "Mon", "Win", "Sas", "Hal", "Kel", "Yel", "Nan",
+            "Ot", "Reg", "Mus", "Thun", "Sud", "Bran", "Kam", "Lun", "Wha"]
+TOWN_SUF = ["onto", "couver", "treal", "nipeg", "katoon", "ifax", "owna",
+            "lowknife", "aimo", "tawa", "ina", "koka", "bury", "don",
+            "loops", "dale", "horse"]
+DUNGEON_NAMES = ["the Caves of Despyse", "the Dungeon of Deceat",
+                 "the Shamebles", "the Wrongway Mines", "Covetous Hollow",
+                 "the Pit of Dastard", "the Hythmoose Deeps", "the Sorry Pits",
+                 "the Frostmaw", "the Toque Barrows", "Goose Hollow",
+                 "the Loon Grotto"]
+ARTIFACTS = ["the Golden Toque", "the Stanley Chalice",
+             "the Great Syrup Reserve", "the Loonie of Destiny",
+             "the Orb of Poutine", "the Beaver Crown", "the Antler of Wisdom",
+             "the Timbit of Eternity", "the Mountie's Lost Badge",
+             "the Paddle of the Ages"]
+FIRST_NAMES = ["Gord", "Bob", "Doug", "Wayne", "Darryl", "Brent", "Tim",
+               "Shirley", "Marie", "Joelle", "Pierre", "Sven", "Agnes",
+               "Leslie", "Rory", "Kate", "Rick", "Gwen", "Moira", "Johnny",
+               "Stevie", "Margaret", "Mabel", "Hector", "Yvette", "Fern",
+               "Duncan", "Elsie", "Lorne", "Nell"]
+GREETINGS = ["Hello there.", "Good day, eh!", "Oh! Sorry, didn't see thee "
+             "there.", "Well met, traveller.", "Cold one today, eh?"]
+HEALTH = ["I'm well, thanks for asking.", "Cold feet, but otherwise fine.",
+          "Never better, eh!", "A touch of frostbite. Nothing serious."]
+BYES = ["Take care, eh!", "Farewell.", "Mind the geese.", "Safe travels!"]
+
+# (job, keyword, job reply, keyword reply); "%D" becomes a dungeon rumour
+JOBS = [
+    ("farmer", "weather", "I grow wheat and worry about the WEATHER.",
+     "Cold, mostly. It's always cold, eh?"),
+    ("maple tapper", "syrup", "I tap the maple trees for their SYRUP.",
+     "The finest syrup in the land was in the royal reserve, until "
+     "Moosedain's minions carried it off."),
+    ("fisher", "serpents", "I fish the lakes. Mind the SERPENTS out on the "
+     "water.", "Sea serpents lurk in the deep water. They can't follow thee "
+     "ashore, but they'll bite if thou walkest the beach."),
+    ("hockey player", "hockey", "I play HOCKEY, of course.",
+     "A good hockey stick makes a fine weapon. Some smithies sell them."),
+    ("woodcutter", "forests", "I fell trees in the deep FORESTS.",
+     "Forests block the view. Climb out of them to see what's about."),
+    ("retired adventurer", "dungeons", "I once delved the DUNGEONS. My knees "
+     "say no more.", "%D"),
+    ("beaver trapper", "beavers", "I trap BEAVERS. Well, I try.",
+     "They're cleverer than they look. They built a dam across my front "
+     "door last week."),
+    ("poet", "snow", "I write poems about SNOW. There are many words for "
+     "it.", "Flurry. Drift. Slush. Sleet. Powder. That's my whole poem."),
+    ("baker", "timbits", "I bake TIMBITS... er, doughnut holes.",
+     "Every hero needs FOOD. Taverns sell rations, and thou'lt starve "
+     "without them."),
+    ("goose herder", "geese", "I herd the GEESE. Nobody herds geese, "
+     "really. They herd you.", "Never turn thy back on a goose, traveller."),
+    ("mapmaker", "map", "I make MAPs.", "Press M to see the map of all the "
+     "lands thou hast seen."),
+    ("pilgrim", "lord", "I'm on my way to see LORD Canadian.",
+     "Lord Canadian raises the level of heroes who have earned it. Visit "
+     "him often!"),
+]
+TIPS = [
+    "Monsters grow fiercer the farther thou strayest from the castle.",
+    "Swamp vapours are poisonous. A healer can cure thee, or a potion.",
+    "Only the Maple Blade can harm Moosedain, or so the bards sing.",
+    "A night at the inn heals all wounds.",
+    "Drink a healing potion when thou art hurt: press P.",
+    "Lord Canadian raises thy level when thou hast gained the experience.",
+    "Treasure chests lie deep in the dungeons.",
+]
+JOKES = ["Why did the moose cross the road? To apologise to the other side!",
+         "What is a moose's favourite music? Moose-ic! ...Moosedain never "
+         "laughs at that one.",
+         "How many Tundrians does it take to change a candle? Ten. One to "
+         "change it, nine to say sorry for the dark.",
+         "Why are geese so rude? Nobody ever apologised to them first."]
+
+
+def cap(s):
+    return s[:1].upper() + s[1:]
+
+
+def compass(dx, dy):
+    ang = math.degrees(math.atan2(-dy, dx)) % 360
+    return ("east", "north-east", "north", "north-west", "west",
+            "south-west", "south", "south-east")[int((ang + 22.5) // 45) % 8]
+
+
+def where(frm, to):
+    """'about 5 leagues to the north-east'"""
+    dx, dy = to[0] - frm[0], to[1] - frm[1]
+    if abs(dx) + abs(dy) <= 3:
+        return "close by"
+    lg = max(1, round(math.hypot(dx, dy) / 3))
+    return "about %d league%s to the %s" % (lg, "s" if lg > 1 else "",
+                                            compass(dx, dy))
+
+
+# ── World generation ─────────────────────────────────────────────────────────
+#
+# Everything about a world is derived from its seed, so a saved game only
+# has to remember the seed plus what the player has done.
+
+WORLD_W = WORLD_H = 64
+
+
+def smooth_noise(rng, w, h, cell):
+    gw, gh = w // cell + 2, h // cell + 2
+    pts = [[rng.random() for _ in range(gw)] for _ in range(gh)]
+    out = []
+    for y in range(h):
+        gy = y / cell
+        y0 = int(gy)
+        ty = gy - y0
+        ty = ty * ty * (3 - 2 * ty)
+        row = []
+        for x in range(w):
+            gx = x / cell
+            x0 = int(gx)
+            tx = gx - x0
+            tx = tx * tx * (3 - 2 * tx)
+            a = pts[y0][x0] + (pts[y0][x0 + 1] - pts[y0][x0]) * tx
+            b = pts[y0 + 1][x0] + (pts[y0 + 1][x0 + 1] - pts[y0 + 1][x0]) * tx
+            row.append(a + (b - a) * ty)
+        out.append(row)
+    return out
+
+
+def fractal(rng, w, h):
+    layers = [(smooth_noise(rng, w, h, c), wt)
+              for c, wt in ((16, 0.5), (8, 0.3), (4, 0.2))]
+    return [[sum(l[y][x] * wt for l, wt in layers) for x in range(w)]
+            for y in range(h)]
+
+
+def terrain_at(e, m):
+    if e < 0.30:
+        return "deep"
+    if e < 0.36:
+        return "water"
+    if e < 0.39:
+        return "sand"
+    if e > 0.68:
+        return "mountain"
+    if e > 0.61:
+        return "hills"
+    if m > 0.56:
+        return "forest"
+    if m < 0.40 and e < 0.50:
+        return "swamp"
+    return "grass"
+
+
+def flood(grid, start, passable):
+    """Breadth-first distances over passable tiles from start."""
+    dist = {start: 0}
+    q = deque([start])
+    while q:
+        x, y = q.popleft()
+        for dx, dy in DIRS:
+            n = (x + dx, y + dy)
+            if (n not in dist and 0 <= n[0] < WORLD_W and 0 <= n[1] < WORLD_H
+                    and grid[n[1]][n[0]] in passable):
+                dist[n] = dist[(x, y)] + 1
+                q.append(n)
+    return dist
+
+
+def generate_world(seed):
+    for attempt in range(100):
+        world = try_world(seed, attempt)
+        if world:
+            return world
+    raise RuntimeError("could not generate a world")
+
+
+def try_world(seed, attempt):
+    rng = random.Random("%s:world:%d" % (seed, attempt))
+    elev = fractal(rng, WORLD_W, WORLD_H)
+    moist = fractal(rng, WORLD_W, WORLD_H)
+    grid = []
+    for y in range(WORLD_H):
+        row = []
+        for x in range(WORLD_W):
+            nx, ny = 2 * x / (WORLD_W - 1) - 1, 2 * y / (WORLD_H - 1) - 1
+            e = elev[y][x] + 0.14 - 0.5 * (nx * nx + ny * ny)
+            row.append(terrain_at(e, moist[y][x]))
+        grid.append(row)
+
+    # The largest stretch of connected land is where everything goes
+    seen, best = set(), set()
+    for y in range(WORLD_H):
+        for x in range(WORLD_W):
+            if grid[y][x] in LAND and (x, y) not in seen:
+                comp = set(flood(grid, (x, y), LAND))
+                seen |= comp
+                if len(comp) > len(best):
+                    best = comp
+    if len(best) < 1100:
+        return None
+
+    cx = sum(p[0] for p in best) / len(best)
+    cy = sum(p[1] for p in best) / len(best)
+    inner = [p for p in best
+             if all((p[0] + dx, p[1] + dy) in best for dx, dy in DIRS)]
+    castle = min(inner, key=lambda p: (p[0] - cx) ** 2 + (p[1] - cy) ** 2)
+    dist = flood(grid, castle, LAND)
+    land = sorted(best)
+    rng.shuffle(land)
+    taken = [castle]
+
+    def pick(n, spacing, pool):
+        out = []
+        for p in pool:
+            if all(abs(p[0] - q[0]) + abs(p[1] - q[1]) >= spacing
+                   for q in taken + out):
+                out.append(p)
+                if len(out) == n:
+                    break
+        taken.extend(out)
+        return out
+
+    towns = pick(5, 11, land)
+    far = sorted(land, key=lambda p: -dist.get(p, 0))
+    lair = pick(1, 9, far[:len(far) // 8])
+    dungeons = pick(5, 9, land)
+    if len(towns) < 5 or len(dungeons) < 5 or not lair:
+        return None
+    dungeons.sort(key=lambda p: dist.get(p, 0))
+
+    realm = rng.choice(REALMS)
+    town_names = set()
+    while len(town_names) < 5:
+        town_names.add(rng.choice(TOWN_PRE) + rng.choice(TOWN_SUF))
+    town_names = sorted(town_names)
+    rng.shuffle(town_names)
+    dnames = rng.sample(DUNGEON_NAMES, 5)
+    artifacts = rng.sample(ARTIFACTS, 4)
+    boss_names = rng.sample(BOSS_NAMES, 4)
+
+    grid[castle[1]][castle[0]] = "castle"
+    sites = {castle: ("castle", 0)}
+    world = {"seed": seed, "realm": realm, "grid": grid, "castle": castle,
+             "towns": [], "dungeons": [], "quests": [], "sites": sites}
+    for i, (x, y) in enumerate(towns):
+        grid[y][x] = "town"
+        sites[(x, y)] = ("town", i)
+        world["towns"].append({"name": town_names[i], "x": x, "y": y})
+    # Nearest dungeons hold the easiest quests; the middle one is optional
+    tiers = (1, 2, 2, 3, 4)
+    quest_of = {0: 0, 1: 1, 3: 2, 4: 3}
+    for i, (x, y) in enumerate(dungeons):
+        grid[y][x] = "dungeon"
+        sites[(x, y)] = ("dungeon", i)
+        d = {"name": dnames[i], "x": x, "y": y, "tier": tiers[i],
+             "levels": (2, 3, 3, 3, 4)[i], "quest": quest_of.get(i),
+             "lair": False, "boss": None, "boss_type": None,
+             "artifact": None}
+        q = d["quest"]
+        if q is not None:
+            kind = rng.choice(BOSS_TYPES[q])
+            d["boss_type"] = kind
+            d["boss"] = "%s %s" % (boss_names[q], BOSS_TITLES[kind])
+            d["artifact"] = artifacts[q]
+            world["quests"].append(i)
+        world["dungeons"].append(d)
+    x, y = lair[0]
+    grid[y][x] = "lair"
+    sites[(x, y)] = ("dungeon", 5)
+    world["dungeons"].append({
+        "name": "Moosedain's Lair", "x": x, "y": y, "tier": 5, "levels": 4,
+        "quest": None, "lair": True, "boss": "Moosedain the Wicked",
+        "boss_type": "moosedain", "artifact": None})
+    return world
+
+
+# ── Maps and creatures ───────────────────────────────────────────────────────
+
+class Area:
+    """One map: the overworld, a town, the castle or a dungeon level."""
+
+    def __init__(self, kind, key, grid, name, edge):
+        self.kind, self.key, self.grid, self.name = kind, key, grid, name
+        self.edge = edge            # tile shown beyond the map edge, or None
+        self.h, self.w = len(grid), len(grid[0])
+        self.mobs = []
+        self.start = (0, 0)
+        self.down = None            # dungeon: the stairs down
+        self.dark = False           # limited light, remembered tiles
+        self.seen = bytearray(self.w * self.h)
+        self.opaque = OPAQUE[kind]
+
+    def inside(self, x, y):
+        return 0 <= x < self.w and 0 <= y < self.h
+
+    def mob_at(self, x, y):
+        for m in self.mobs:
+            if m.x == x and m.y == y:
+                return m
+        return None
+
+
+class Mob:
+    """A creature on a map: a monster, or a person to talk to."""
+
+    def __init__(self, tile, name, x, y):
+        self.tile, self.name, self.x, self.y = tile, name, x, y
+        self.hostile = False
+        self.kind = None
+        self.hp = self.maxhp = 1
+        self.dmg, self.defense, self.level, self.xp = (1, 2), 0, 1, 0
+        self.traits = ""
+        self.boss = False
+        self.dungeon = None         # boss: index of its dungeon
+        self.roam = None            # person: tiles they wander (None: stay)
+        self.title = ""             # person: "the farmer" until NAME asked
+        self.known = False
+        self.talk = {}
+        self.shop = None
+        self.lord = False
+        self.greet = ""
+
+
+def make_monster(kind, x, y):
+    t = MONSTERS[kind]
+    m = Mob(t.tile, t.name, x, y)
+    m.hostile, m.kind = True, kind
+    m.hp = m.maxhp = t.hp
+    m.dmg, m.defense, m.level, m.xp = t.dmg, t.defense, t.tier, t.xp
+    m.traits = t.traits
+    return m
+
+
+def make_boss(d, di, x, y):
+    m = make_monster(d["boss_type"], x, y)
+    if not d["lair"]:
+        m.hp = m.maxhp = m.hp * 3
+        m.dmg = (m.dmg[0] + 2, m.dmg[1] + m.dmg[1] // 2)
+        m.defense += 2
+        m.level += 1
+        m.xp *= 5
+    m.name, m.boss, m.dungeon = d["boss"], True, di
+    return m
+
+
+def person(tile, title, name, x, y, talk, roam=None):
+    m = Mob(tile, name, x, y)
+    m.title, m.roam = title, roam
+    m.talk = {"name": "My name is %s." % name, "health": random.choice(HEALTH)}
+    m.talk.update(talk)
+    m.greet = random.choice(GREETINGS)
+    return m
+
+
+def town_rumours(world, here):
+    out = list(TIPS)
+    for d in world["dungeons"]:
+        spot = (d["x"], d["y"])
+        if d["lair"]:
+            out.append("Moosedain's lair lies %s, sealed by enchanted ice."
+                       % where(here, spot))
+            continue
+        out.append("They say %s lies %s." % (d["name"], where(here, spot)))
+        if d["boss"]:
+            out.append("%s lurks in the depths of %s, guarding %s."
+                       % (d["boss"], d["name"], d["artifact"]))
+    out.append("Lord Canadian's castle lies %s." % where(here, world["castle"]))
+    for t in world["towns"]:
+        if (t["x"], t["y"]) != here:
+            out.append("The town of %s lies %s."
+                       % (t["name"], where(here, (t["x"], t["y"]))))
+    return out
+
+
+def townsfolk(rng, world, here, x, y, roam):
+    """A random townsperson with a job, a hobby-horse and a rumour."""
+    job, kw, job_line, reply = rng.choice(JOBS)
+    rumours = town_rumours(world, here)
+    if reply == "%D":
+        d = rng.choice(world["dungeons"][:5])
+        reply = "%s lies %s. Bring torches... oh, and a sword." % (
+            cap(d["name"]), where(here, (d["x"], d["y"])))
+    news = rng.choice(rumours)
+    name = rng.choice(FIRST_NAMES)
+    tile = rng.choice(("man", "woman"))
+    m = person(tile, "the " + job, name, x, y,
+               {"job": job_line + " Ask me for NEWS, if thou likest.",
+                kw: reply, "news": news, "rumour": news, "rumor": news},
+               roam)
+    m.talk["health"] = rng.choice(HEALTH)
+    m.greet = rng.choice(GREETINGS)
+    return m
+
+
+def blank(w, h, tile):
+    return [[tile] * w for _ in range(h)]
+
+
+def frame(g, x0, y0, x1, y1, tile):
+    for x in range(x0, x1 + 1):
+        g[y0][x] = g[y1][x] = tile
+    for y in range(y0, y1 + 1):
+        g[y][x0] = g[y][x1] = tile
+
+
+def fill(g, x0, y0, x1, y1, tile):
+    for y in range(y0, y1 + 1):
+        for x in range(x0, x1 + 1):
+            g[y][x] = tile
+
+
+SHOP_KINDS = ["weapon", "armor", "healer", "inn", "tavern"]
+SHOP_TITLES = {"weapon": "the blacksmith", "armor": "the armourer",
+               "healer": "the healer", "inn": "the innkeeper",
+               "tavern": "the barkeep", "quartermaster": "the quartermaster"}
+
+
+def make_town(world, ti):
+    t = world["towns"][ti]
+    here = (t["x"], t["y"])
+    rng = random.Random("%s:town:%d" % (world["seed"], ti))
+    W, H, mx, my = 34, 26, 16, 12
+    g = blank(W, H, "grass")
+    frame(g, 1, 1, W - 2, H - 2, "brick")
+    for y in range(H):                       # streets (and gates)
+        g[y][mx] = g[y][mx + 1] = "cobble"
+    for x in range(W):
+        g[my][x] = g[my + 1][x] = "cobble"
+    g[my][mx] = "fountain"
+    area = Area("town", ("town", ti), g, "the town of " + t["name"], "grass")
+    area.start = (mx, H - 1)
+
+    slots = [(sx, top) for sx in (2, 9, 18, 25) for top in (True, False)]
+    rng.shuffle(slots)
+    kinds = SHOP_KINDS + ["house", "house"]
+    for kind, (sx, top) in zip(kinds, slots):
+        bw, bh = 6, rng.randint(5, 7)
+        bx = sx + rng.randint(0, 1)
+        by = my - 1 - bh if top else my + 3
+        frame(g, bx, by, bx + bw - 1, by + bh - 1, "brick")
+        fill(g, bx + 1, by + 1, bx + bw - 2, by + bh - 2, "wood")
+        dx = bx + rng.randint(1, bw - 2)
+        dy = by + bh - 1 if top else by
+        out = dy + 1 if top else dy - 1
+        g[dy][dx] = "door"
+        g[out][dx] = "cobble"
+        if kind == "house":
+            name = rng.choice(FIRST_NAMES)
+            job, kw, job_line, reply = rng.choice(JOBS[:5] + JOBS[6:])
+            news = rng.choice(town_rumours(world, here))
+            area.mobs.append(person(
+                rng.choice(("man", "woman")), "the " + job, name,
+                bx + 2, by + 2,
+                {"job": job_line + " Ask me for NEWS.", kw: reply,
+                 "news": news, "rumour": news, "rumor": news},
+                roam={"wood"}))
+            continue
+        g[out][dx + 1] = "sign_" + kind
+        keeper_y = by + 1 if top else by + bh - 2
+        counter_y = keeper_y + 1 if top else keeper_y - 1
+        fill(g, bx + 1, counter_y, bx + bw - 2, counter_y, "counter")
+        area.mobs.append(shopkeeper(rng, world, kind, bx + bw // 2,
+                                    keeper_y, here))
+
+    # trees on open grass, away from the streets
+    for _ in range(60):
+        x, y = rng.randint(2, W - 3), rng.randint(2, H - 3)
+        if g[y][x] == "grass" and all(
+                g[y + dy][x + dx] in ("grass", "forest", "brick")
+                for dx, dy in DIRS):
+            g[y][x] = "forest"
+
+    def free_spot(tiles):
+        while True:
+            x, y = rng.randint(2, W - 3), rng.randint(2, H - 3)
+            if g[y][x] in tiles and not area.mob_at(x, y):
+                return x, y
+
+    for gx, gy in ((mx - 1, H - 3), (mx + 2, 2)):
+        g[gy][gx] = "grass"
+        name = rng.choice(FIRST_NAMES)
+        area.mobs.append(person(
+            "guard", "the Mountie", "Constable " + name, gx, gy,
+            {"job": "I keep the peace in %s. We always get our MONSTER."
+             % t["name"],
+             "monster": "Monsters grow fiercer the farther thou travellest "
+             "from Lord Canadian's castle. Start close to home.",
+             "news": rng.choice(town_rumours(world, here))}))
+    for _ in range(6):
+        x, y = free_spot(("grass", "cobble"))
+        area.mobs.append(townsfolk(rng, world, here, x, y,
+                                   {"grass", "cobble"}))
+    return area
+
+
+def shopkeeper(rng, world, kind, x, y, here):
+    name = rng.choice(FIRST_NAMES)
+    shop = {"kind": kind}
+    if kind == "weapon":
+        shop["title"] = "%s's Smithy" % name
+        shop["stock"] = sorted(rng.sample(SHOP_WEAPONS, 4),
+                               key=lambda n: WEAPONS[n].price)
+        job = "I forge and sell weapons."
+    elif kind == "armor":
+        shop["title"] = "%s's Armoury" % name
+        shop["stock"] = sorted(rng.sample(SHOP_ARMOURS, 3),
+                               key=lambda n: ARMOURS[n].price)
+        job = "I sell armour, to keep the monsters' teeth out of thee."
+    elif kind == "healer":
+        shop["title"] = "the House of Healing"
+        job = "I heal wounds and cure poison, and I sell potions."
+    elif kind == "inn":
+        shop["title"] = "the %s %s Inn" % (
+            rng.choice(("Sleepy", "Frozen", "Snoring", "Drowsy", "Cozy")),
+            rng.choice(("Moose", "Goose", "Beaver", "Loon", "Caribou")))
+        job = "I keep the inn. A night's rest heals all wounds."
+    else:
+        shop["title"] = "the %s %s" % (
+            rng.choice(("Tipsy", "Jolly", "Thirsty", "Rowdy", "Polite")),
+            rng.choice(("Loon", "Moose", "Puck", "Canoe", "Toque")))
+        job = "I run the tavern. Food for the road, and ale for gossip."
+    news = rng.choice(town_rumours(world, here))
+    m = person("woman" if kind == "healer" else "merchant", SHOP_TITLES[kind],
+               name, x, y, {"job": job + " Wouldst thou BUY something?",
+                            "news": news, "rumour": news, "rumor": news})
+    m.shop = shop
+    m.greet = "Welcome to %s! Wouldst thou BUY something?" % shop["title"]
+    return m
+
+
+def make_castle(world):
+    rng = random.Random("%s:castle" % world["seed"])
+    W, H, mx = 33, 27, 16
+    g = blank(W, H, "grass")
+    frame(g, 1, 1, W - 2, H - 2, "water")
+    frame(g, 2, 2, W - 3, H - 3, "brick")
+    frame(g, 9, 3, 23, 12, "brick")
+    fill(g, 10, 4, 22, 11, "stone")
+    for y in range(5, 12):
+        g[y][mx] = "carpet"
+    g[4][mx] = "throne"
+    g[12][mx] = "door"
+    for y in range(13, H):
+        g[y][mx] = "cobble"
+    for x in range(4, 30):
+        g[19][x] = "cobble"
+    g[17][8] = g[17][24] = "fountain"
+    area = Area("castle", ("castle",), g, "Castle Canadian", "grass")
+    area.start = (mx, H - 1)
+
+    lord = person("lord", "Lord Canadian", "Lord Canadian", mx, 4, {})
+    lord.lord = lord.known = True
+    area.mobs.append(lord)
+    for gx, gy in ((13, 6), (19, 6), (13, 9), (19, 9), (15, 23), (17, 23)):
+        name = rng.choice(FIRST_NAMES)
+        area.mobs.append(person(
+            "guard", "the royal Mountie", "Sergeant " + name, gx, gy,
+            {"job": "I guard His Lordship. Speak with him about thy QUEST.",
+             "quest": "Lord Canadian sits upon his throne, at the end of "
+             "the red carpet. Walk up and speak with him.",
+             "news": rng.choice(TIPS)}))
+    jester = person("jester", "the jester", "Pip", 11, 10,
+                    {"job": "I am the royal fool. Wouldst thou hear a JOKE?",
+                     "joke": " / ".join(rng.sample(JOKES, 2)),
+                     "news": "Did thou knowest Lord Canadian once "
+                     "apologised to a door for walking into it?"},
+                    roam={"stone"})
+    area.mobs.append(jester)
+    doc = person("woman", "the royal physician", "Dame Agatha", 6, 20,
+                 {"job": "I tend the royal household. Wouldst thou BUY "
+                  "something?"})
+    doc.shop = {"kind": "healer", "title": "the royal infirmary"}
+    doc.greet = "Hurt, are we? Wouldst thou BUY something?"
+    qm = person("merchant", "the quartermaster", "Master Hubert", 26, 20,
+                {"job": "I keep the royal stores. Wouldst thou BUY "
+                 "something?"})
+    qm.shop = {"kind": "quartermaster", "title": "the royal stores"}
+    qm.greet = "Provisions for the road? Wouldst thou BUY something?"
+    area.mobs += [doc, qm]
+    here = world["castle"]
+    for _ in range(3):
+        while True:
+            x, y = rng.randint(4, 28), rng.randint(14, 22)
+            if g[y][x] in ("grass", "cobble") and not area.mob_at(x, y):
+                break
+        area.mobs.append(townsfolk(rng, world, here, x, y,
+                                   {"grass", "cobble"}))
+    for _ in range(40):
+        x, y = rng.randint(3, W - 4), rng.randint(13, H - 4)
+        if g[y][x] == "grass" and not area.mob_at(x, y) and all(
+                g[y + dy][x + dx] in ("grass", "forest", "brick")
+                for dx, dy in DIRS):
+            g[y][x] = "forest"
+    return area
+
+
+def make_dungeon_level(world, di, level, flags):
+    d = world["dungeons"][di]
+    rng = random.Random("%s:dungeon:%d:%d" % (world["seed"], di, level))
+    W, H = 44, 30
+    g = blank(W, H, "dwall")
+    rooms = []
+    for _ in range(400):
+        if len(rooms) >= 10:
+            break
+        rw, rh = rng.randint(4, 9), rng.randint(3, 6)
+        rx, ry = rng.randint(1, W - rw - 1), rng.randint(1, H - rh - 1)
+        if any(rx - 2 < x + w and x - 2 < rx + rw and
+               ry - 2 < y + h and y - 2 < ry + rh for x, y, w, h in rooms):
+            continue
+        rooms.append((rx, ry, rw, rh))
+    for rx, ry, rw, rh in rooms:
+        fill(g, rx, ry, rx + rw - 1, ry + rh - 1, "dfloor")
+    centers = [(rx + rw // 2, ry + rh // 2) for rx, ry, rw, rh in rooms]
+
+    def corridor(a, b):
+        (x1, y1), (x2, y2) = a, b
+        if rng.random() < 0.5:
+            fill(g, min(x1, x2), y1, max(x1, x2), y1, "dfloor")
+            fill(g, x2, min(y1, y2), x2, max(y1, y2), "dfloor")
+        else:
+            fill(g, x1, min(y1, y2), x1, max(y1, y2), "dfloor")
+            fill(g, min(x1, x2), y2, max(x1, x2), y2, "dfloor")
+
+    order = sorted(range(len(rooms)), key=lambda i: centers[i])
+    for a, b in zip(order, order[1:]):
+        corridor(centers[a], centers[b])
+    for _ in range(2):
+        corridor(*rng.sample(centers, 2))
+
+    up = centers[0]
+    far = max(centers, key=lambda c: abs(c[0] - up[0]) + abs(c[1] - up[1]))
+    g[up[1]][up[0]] = "stairs_up"
+    last = level == d["levels"]
+    area = Area("dungeon", ("dungeon", di, level), g,
+                "%s, level %d" % (cap(d["name"]), level), None)
+    area.dark = True
+    area.start = up
+    area.far = far
+    if not last:
+        g[far[1]][far[0]] = "stairs_down"
+        area.down = far
+    chests = rng.randint(2, 4)
+    if last and d["quest"] is None and not d["lair"]:
+        chests += 4
+    for _ in range(chests):
+        rx, ry, rw, rh = rng.choice(rooms)
+        x, y = rng.randint(rx, rx + rw - 1), rng.randint(ry, ry + rh - 1)
+        if g[y][x] == "dfloor" and (x, y) not in centers:
+            if "chest:%d:%d:%d,%d" % (di, level, x, y) not in flags:
+                g[y][x] = "chest"
+    if last and d["boss"] and "boss:%d" % di not in flags:
+        area.mobs.append(make_boss(d, di, far[0], far[1]))
+    area.floor = [(x, y) for y in range(H) for x in range(W)
+                  if g[y][x] == "dfloor"]
+    return area
+
+
+def dungeon_monster(d, level):
+    eff = min(6, d["tier"] + level - 1)
+    kinds = [k for k, t in MONSTERS.items()
+             if t.habitat in ("dungeon", "both") and eff - 2 <= t.tier <= eff]
+    return random.choice(kinds)
+
+
+# ── Sound ────────────────────────────────────────────────────────────────────
+#
+# Effects are synthesized into small WAV files once at startup and played
+# with whatever command-line player the system has.
+
+RATE = 22050
+
+
+class Sound:
+    def __init__(self):
+        self.muted = False
+        self.player = None
+        for cmd in (["afplay"], ["paplay"], ["aplay", "-q"]):
+            if shutil.which(cmd[0]):
+                self.player = cmd
+                break
+        self.files = {}
+        if self.player:
+            self.dir = tempfile.mkdtemp(prefix="penultimate-")
+            atexit.register(shutil.rmtree, self.dir, True)
+            threading.Thread(target=self.synthesize, daemon=True).start()
+
+    @staticmethod
+    def tone(buf, t0, freq, dur, wave_type="sine", gain=0.25, attack=0.005):
+        start = int(t0 * RATE)
+        n = int(dur * RATE)
+        need = start + n
+        if len(buf) < need:
+            buf.extend([0.0] * (need - len(buf)))
+        for k in range(n):
+            t = k / RATE
+            if t < attack:
+                env = 0.0001 * (gain / 0.0001) ** (t / attack)
+            else:
+                env = gain * (0.0001 / gain) ** ((t - attack) / (dur - attack))
+            ph = (freq * t) % 1.0
+            if wave_type == "sine":
+                v = math.sin(2 * math.pi * ph)
+            elif wave_type == "square":
+                v = 1.0 if ph < 0.5 else -1.0
+            else:  # triangle
+                v = 4 * ph - 1 if ph < 0.5 else 3 - 4 * ph
+            buf[start + k] += v * env
+
+    @staticmethod
+    def noise(buf, t0, dur, freq=800, gain=0.3):
+        """High-passed white-noise burst with an exponential decay."""
+        start = int(t0 * RATE)
+        n = int(dur * RATE)
+        need = start + n
+        if len(buf) < need:
+            buf.extend([0.0] * (need - len(buf)))
+        rc = 1 / (2 * math.pi * freq)
+        a = rc / (rc + 1 / RATE)
+        y = x_prev = 0.0
+        for k in range(n):
+            x = random.uniform(-1, 1)
+            y = a * (y + x - x_prev)
+            x_prev = x
+            env = gain * (0.0001 / gain) ** (k / n)
+            buf[start + k] += y * env
+
+    def write(self, name, buf):
+        path = os.path.join(self.dir, name + ".wav")
+        pcm = array.array("h", (int(max(-1.0, min(1.0, v)) * 32000)
+                                for v in buf + [0.0] * 200))
+        if sys.byteorder == "big":
+            pcm.byteswap()
+        with wave.open(path, "wb") as w:
+            w.setnchannels(1)
+            w.setsampwidth(2)
+            w.setframerate(RATE)
+            w.writeframes(pcm.tobytes())
+        self.files[name] = path
+
+    def synthesize(self):
+        tone, noise = self.tone, self.noise
+        b = []
+        noise(b, 0, 0.07, 1400, 0.3)
+        tone(b, 0, 200, 0.07, "square", 0.08)
+        self.write("hit", b)
+        b = []
+        noise(b, 0, 0.06, 3500, 0.12)
+        self.write("miss", b)
+        b = []
+        tone(b, 0, 160, 0.12, "square", 0.14)
+        tone(b, 0.05, 110, 0.14, "square", 0.12)
+        self.write("hurt", b)
+        b = []
+        for i, f in enumerate((660, 495, 330, 220)):
+            tone(b, i * 0.06, f, 0.1, "triangle", 0.2)
+        self.write("kill", b)
+        b = []
+        tone(b, 0, 1318.5, 0.08, "triangle", 0.18)
+        tone(b, 0.06, 1760, 0.14, "triangle", 0.16)
+        self.write("gold", b)
+        b = []
+        for i, f in enumerate((523.25, 659.25, 783.99, 1046.5)):
+            tone(b, i * 0.09, f, 0.3, "triangle", 0.22)
+        self.write("level", b)
+        b = []
+        for i in range(3):
+            noise(b, i * 0.09, 0.06, 900 - i * 200, 0.2)
+        self.write("stairs", b)
+        b = []
+        noise(b, 0, 0.1, 500, 0.18)
+        tone(b, 0, 90, 0.1, "sine", 0.1)
+        self.write("door", b)
+        b = []
+        run = (392.0, 523.25, 659.25, 783.99, 1046.5)
+        for i, f in enumerate(run):
+            tone(b, i * 0.1, f, 0.45, "triangle", 0.25)
+        tone(b, 0.55, 1046.5, 0.8, "triangle", 0.2)
+        tone(b, 0.55, 1318.5, 0.8, "triangle", 0.15)
+        self.write("quest", b)
+        b = []
+        for i, f in enumerate((392.0, 349.2, 311.1, 261.6)):
+            tone(b, i * 0.22, f, 0.4, "square", 0.1)
+        self.write("death", b)
+        b = []
+        for i in range(8):
+            tone(b, i * 0.03, 400 + i * 90, 0.06, "sine", 0.15)
+        self.write("potion", b)
+        b = []
+        tone(b, 0, 110, 0.07, "square", 0.07)
+        self.write("bump", b)
+        b = []
+        tone(b, 0, 300, 0.12, "sine", 0.12)
+        tone(b, 0.04, 200, 0.2, "sine", 0.1)
+        noise(b, 0, 0.25, 300, 0.2)
+        self.write("fire", b)
+
+    def play(self, name):
+        path = self.files.get(name)
+        if self.muted or not path:
+            return
+        try:
+            subprocess.Popen(self.player + [path], stdout=subprocess.DEVNULL,
+                             stderr=subprocess.DEVNULL)
+        except OSError:
+            pass
+
+
+# ── Persistence ──────────────────────────────────────────────────────────────
+
+def load_saved():
+    try:
+        with open(SAVE_FILE) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def pack_bits(b):
+    return base64.b64encode(zlib.compress(bytes(b))).decode()
+
+
+def unpack_bits(s, n):
+    b = bytearray(zlib.decompress(base64.b64decode(s)))
+    if len(b) != n:
+        raise ValueError("bad map")
+    return b
+
+
+# ── UI ───────────────────────────────────────────────────────────────────────
+
+PANEL = "#17130f"
+LOG_BG = "#0d0b09"
+INK = "#efe6d2"
+INK_DIM = "#a99f8a"
+ACCENT = "#d7a24a"
+GOOD = "#9be08a"
+BAD = "#ff8a7a"
+TALK = "#9fd3ff"
+GOLD = "#f0c85a"
+MONO = ("Menlo", 12)
+
+MOVE_KEYS = {"Up": (0, -1), "w": (0, -1), "KP_Up": (0, -1), "KP_8": (0, -1),
+             "Down": (0, 1), "s": (0, 1), "KP_Down": (0, 1), "KP_2": (0, 1),
+             "Left": (-1, 0), "a": (-1, 0), "KP_Left": (-1, 0),
+             "KP_4": (-1, 0), "Right": (1, 0), "d": (1, 0),
+             "KP_Right": (1, 0), "KP_6": (1, 0)}
+
+HELP = """PENULTIMATE
+
+Arrow keys / WASD   move; walk into monsters to fight
+                    and into people to talk
+Space               wait a turn
+P                   drink a healing potion
+M                   map of the lands you have seen
++ / -               zoom in / out
+V                   sound on / off
+N                   new game (a whole new world)
+Ctrl-Q / Cmd-Q      quit (the game is saved)
+
+Talking: type a word and press Return. Everyone knows
+NAME, JOB and BYE; most know NEWS. Try words in CAPITALS.
+Shopkeepers answer BUY; talk across their counters.
+
+Lord Canadian heals you and raises your level once you
+have enough experience. Visit him often.
+
+Press any key to close."""
+
+
+class Game:
+    def __init__(self, root):
+        self.root = root
+        self.sound = Sound()
+        saved = load_saved()
+        self.sound.muted = bool(saved.get("muted"))
+        scale = saved.get("scale")
+        self.scale = scale if scale in (1, 2, 3, 4) else (
+            3 if root.winfo_screenheight() >= 1000 else 2)
+
+        root.title("Penultimate")
+        root.configure(bg=PANEL)
+        root.minsize(720, 560)
+        root.geometry("1180x860" if self.scale >= 3 else "980x720")
+
+        top = tk.Frame(root, bg=PANEL)
+        top.pack(fill="x")
+        tk.Label(top, text="Penultimate", bg=PANEL, fg=ACCENT,
+                 font=("Helvetica", 16, "bold")).pack(side="left", padx=10,
+                                                       pady=6)
+        self.status = tk.Label(top, bg=PANEL, fg=INK_DIM,
+                               font=("Helvetica", 12))
+        self.status.pack(side="left", padx=10)
+        self.turns = tk.Label(top, bg=PANEL, fg=INK_DIM,
+                              font=("Helvetica", 12))
+        self.turns.pack(side="right", padx=10)
+
+        bar = tk.Frame(root, bg=PANEL)
+        bar.pack(side="bottom", fill="x")
+        self.btn = {}
+        for key, label, cmd in (("potion", "Potion", self.drink),
+                                ("map", "Map", self.toggle_map),
+                                ("help", "Help", self.show_help),
+                                ("out", "Zoom -", lambda: self.zoom(-1)),
+                                ("in", "Zoom +", lambda: self.zoom(1)),
+                                ("mute", "Sound: on", self.toggle_mute),
+                                ("new", "New Game", self.ask_new_game)):
+            b = tk.Button(bar, text=label, command=cmd, width=9,
+                          highlightbackground=PANEL, takefocus=0)
+            b.pack(side="left", expand=True, pady=6)
+            self.btn[key] = b
+
+        body = tk.Frame(root, bg=PANEL)
+        body.pack(fill="both", expand=True)
+        side = tk.Frame(body, bg=PANEL, width=230)
+        side.pack(side="right", fill="y")
+        side.pack_propagate(False)
+        self.panel = tk.Label(side, bg=PANEL, fg=INK, font=MONO,
+                              justify="left", anchor="nw")
+        self.panel.pack(fill="x", padx=10, pady=(8, 0))
+        self.condition = tk.Label(side, bg=PANEL, fg=BAD, justify="left",
+                                  anchor="nw",
+                                  font=("Menlo", 12, "bold"))
+        self.condition.pack(fill="x", padx=10)
+
+        left = tk.Frame(body, bg=PANEL)
+        left.pack(side="left", fill="both", expand=True)
+        self.log = tk.Text(left, height=8, bg=LOG_BG, fg=INK, font=MONO,
+                           wrap="word", bd=0, highlightthickness=0,
+                           padx=8, pady=4, state="disabled", takefocus=0)
+        self.log.pack(side="bottom", fill="x")
+        for tag, color in (("info", INK_DIM), ("talk", TALK), ("you", ACCENT),
+                           ("bad", BAD), ("good", GOOD), ("gold", GOLD),
+                           ("quest", ACCENT)):
+            self.log.tag_configure(tag, foreground=color)
+        self.log.tag_configure("quest", font=("Menlo", 12, "bold"))
+        self.talkbar = tk.Frame(left, bg=PANEL)
+        self.prompt = tk.Label(self.talkbar, text="Your interest:", bg=PANEL,
+                               fg=ACCENT, font=MONO)
+        self.prompt.pack(side="left", padx=(8, 4), pady=4)
+        self.entry = tk.Entry(self.talkbar, bg=LOG_BG, fg=INK, font=MONO,
+                              insertbackground=INK, highlightthickness=0,
+                              bd=1)
+        self.entry.pack(side="left", fill="x", expand=True, padx=(0, 8),
+                        pady=4)
+        self.entry.bind("<Return>", self.on_entry)
+        self.entry.bind("<Escape>", lambda e: self.end_talk())
+        self.canvas = tk.Canvas(left, bg="black", highlightthickness=0)
+        self.canvas.pack(fill="both", expand=True)
+
+        self.load_images()
+        self.cells = []
+        self.shown = []
+        self.view = (0, 0)
+        self.fx_token = 0
+        self.overlay = None         # None, "map", "help" or "won"
+        self.talk = None            # {"mob", "mode"} while in a conversation
+        self.busy = False           # dying: input is ignored
+        self.visible = set()
+        self.cache = {}
+
+        self.canvas.bind("<Configure>", lambda e: self.layout())
+        root.bind("<KeyPress>", self.on_key)
+        for k in ("Control-q", "Command-q"):
+            root.bind("<%s>" % k, lambda e: self.quit())
+        root.protocol("WM_DELETE_WINDOW", self.quit)
+
+        try:
+            self.restore(saved["game"])
+        except (KeyError, TypeError, ValueError, IndexError, zlib.error):
+            self.new_game()
+
+    # ── Images ──
+
+    def load_images(self):
+        """16px tiles from TILE_PNG, plus darkened copies of the terrain (for
+        remembered dungeon squares) and an average colour for the map."""
+        self.base, self.dark, self.avg = {}, {}, {}
+        for name, data in TILE_PNG.items():
+            img = tk.PhotoImage(data="".join(data))
+            self.base[name] = img
+            if name in SPRITES:
+                continue
+            rows, tot = [], [0, 0, 0]
+            for y in range(16):
+                row = []
+                for x in range(16):
+                    c = img.get(x, y)
+                    if isinstance(c, str):
+                        c = tuple(int(v) for v in c.split())
+                    for i in range(3):
+                        tot[i] += c[i]
+                    row.append("#%02x%02x%02x" % tuple(int(v * 0.38)
+                                                       for v in c[:3]))
+                rows.append("{" + " ".join(row) + "}")
+            dark = tk.PhotoImage(width=16, height=16)
+            dark.put(" ".join(rows))
+            self.dark[name] = dark
+            self.avg[name] = "#%02x%02x%02x" % tuple(v // 256 for v in tot)
+        self.scale_images()
+
+    def scale_images(self):
+        s = self.scale
+        self.img = {n: i.zoom(s) for n, i in self.base.items()}
+        self.dimg = {n: i.zoom(s) for n, i in self.dark.items()}
+
+    # ── Game setup ──
+
+    def setup_world(self, seed):
+        self.world = generate_world(seed)
+        self.world_area = Area("world", ("world",), self.world["grid"],
+                               self.world["realm"], "deep")
+        self.cache = {}
+
+    def new_game(self):
+        self.setup_world(random.randrange(1 << 31))
+        self.p = dict(START_PLAYER)
+        self.flags, self.held, self.returned = set(), [], set()
+        self.turn = 0
+        cx, cy = self.world["castle"]
+        start = next((cx + dx, cy + dy) for dx, dy in ((0, 1), (-1, 0),
+                                                       (1, 0), (0, -1))
+                     if self.world["grid"][cy + dy][cx + dx] in LAND)
+        self.area = self.world_area
+        self.pos = list(start)
+        self.world_pos = list(start)
+        self.overlay = None
+        self.end_talk()
+        self.busy = False
+        self.log.config(state="normal")
+        self.log.delete("1.0", "end")
+        self.log.config(state="disabled")
+        self.say("Welcome to %s, %s!" % (self.world["realm"],
+                                         self.p["name"]), "quest")
+        self.say("Lord Canadian's castle stands beside thee. Walk into it "
+                 "and speak with His Lordship: he has a QUEST for thee.")
+        self.say("Arrow keys or WASD move. Walk into people to talk and into "
+                 "monsters to fight. Press ? for help.", "info")
+        self.layout()
+        self.save()
+
+    def restore(self, g):
+        self.setup_world(int(g["seed"]))
+        self.p = dict(START_PLAYER)
+        self.p.update(g["player"])
+        if self.p["weapon"] not in WEAPONS or self.p["armor"] not in ARMOURS:
+            raise ValueError("bad equipment")
+        self.flags = set(g.get("flags", []))
+        self.held = [int(i) for i in g.get("held", [])]
+        self.returned = set(int(i) for i in g.get("returned", []))
+        self.turn = int(g.get("turn", 0))
+        self.world_area.seen = unpack_bits(g["seen"], WORLD_W * WORLD_H)
+        self.world_pos = [int(v) for v in g["world_pos"]]
+        key = tuple(g["key"])
+        self.area = (self.world_area if key[0] == "world"
+                     else self.get_area(key))
+        self.pos = [int(v) for v in g["pos"]]
+        if not self.area.inside(*self.pos):
+            raise ValueError("bad position")
+        if self.p["hp"] <= 0:
+            self.resurrect()
+        self.say("Welcome back to %s, %s." % (self.world["realm"],
+                                              self.p["name"]), "quest")
+        self.say("Press ? for help.", "info")
+        self.layout()
+
+    def save(self):
+        data = {"muted": self.sound.muted, "scale": self.scale}
+        if getattr(self, "p", None):
+            data["game"] = {
+                "seed": self.world["seed"], "player": self.p,
+                "flags": sorted(self.flags), "held": self.held,
+                "returned": sorted(self.returned), "turn": self.turn,
+                "key": list(self.area.key), "pos": self.pos,
+                "world_pos": self.world_pos,
+                "seen": pack_bits(self.world_area.seen)}
+        try:
+            with open(SAVE_FILE, "w") as f:
+                json.dump(data, f)
+        except OSError:
+            pass
+
+    def quit(self):
+        self.save()
+        self.root.destroy()
+
+    # ── Areas ──
+
+    def get_area(self, key):
+        if key in self.cache:
+            return self.cache[key]
+        if key[0] == "town":
+            area = make_town(self.world, key[1])
+        elif key[0] == "castle":
+            area = make_castle(self.world)
+        elif key[0] == "dungeon":
+            di, level = key[1], key[2]
+            area = make_dungeon_level(self.world, di, level, self.flags)
+            d = self.world["dungeons"][di]
+            sx, sy = area.start
+            spots = [p for p in area.floor
+                     if abs(p[0] - sx) + abs(p[1] - sy) >= 8]
+            for x, y in random.sample(spots, min(len(spots), 5 + 2 * level)):
+                area.mobs.append(make_monster(dungeon_monster(d, level), x, y))
+        else:
+            raise ValueError("bad area")
+        self.cache[key] = area
+        return area
+
+    def enter(self, area, pos, sound="door"):
+        self.area = area
+        self.pos = list(pos)
+        self.sound.play(sound)
+        self.layout()
+        self.save()
+
+    def leave_to_world(self):
+        self.cache = {k: v for k, v in self.cache.items()
+                      if k[0] != "dungeon"}
+        self.say("You return to the wilderness of %s."
+                 % self.world["realm"], "info")
+        self.enter(self.world_area, self.world_pos)
+
+    def enter_site(self, kind, i):
+        self.world_pos = list(self.pos)
+        if kind == "town":
+            area = self.get_area(("town", i))
+            self.say("You enter %s." % area.name, "info")
+        elif kind == "castle":
+            area = self.get_area(("castle",))
+            self.say("You enter Castle Canadian. A Mountie salutes.", "info")
+        else:
+            d = self.world["dungeons"][i]
+            area = self.get_area(("dungeon", i, 1))
+            self.say("You climb down into %s." % d["name"], "info")
+            self.enter(area, area.start, "stairs")
+            return
+        self.enter(area, area.start)
+
+    def change_level(self, delta):
+        _, di, level = self.area.key
+        if level + delta == 0:
+            self.leave_to_world()
+            return
+        area = self.get_area(("dungeon", di, level + delta))
+        self.say("You climb %s to level %d."
+                 % ("down" if delta > 0 else "up", level + delta), "info")
+        self.enter(area, area.start if delta > 0 else area.down, "stairs")
+
+    # ── Messages ──
+
+    def say(self, text, tag=None):
+        self.log.config(state="normal")
+        self.log.insert("end", text + "\n", tag or ())
+        n = int(self.log.index("end").split(".")[0])
+        if n > 500:
+            self.log.delete("1.0", "%d.0" % (n - 400))
+        self.log.config(state="disabled")
+        self.log.see("end")
+
+    @staticmethod
+    def the(mob):
+        return mob.name if mob.boss else "the " + mob.name
+
+    # ── Turns ──
+
+    def on_key(self, ev):
+        if self.talk or self.busy or ev.state & 0x0C:
+            return
+        k = ev.keysym
+        if self.overlay:
+            if self.overlay == "won" and k in ("n", "N"):
+                self.new_game()
+            elif self.overlay != "won" or k in ("Escape", "Return"):
+                self.overlay = None
+                self.render()
+            return
+        if k in MOVE_KEYS:
+            self.move(*MOVE_KEYS[k])
+        elif k in ("space", "period", "KP_5"):
+            self.say("You wait.", "info")
+            self.end_turn()
+        elif k in ("p", "P"):
+            self.drink()
+        elif k in ("m", "M"):
+            self.toggle_map()
+        elif k in ("question", "slash", "h", "H", "F1"):
+            self.show_help()
+        elif k in ("v", "V"):
+            self.toggle_mute()
+        elif k in ("plus", "equal", "KP_Add"):
+            self.zoom(1)
+        elif k in ("minus", "underscore", "KP_Subtract"):
+            self.zoom(-1)
+        elif k in ("n", "N"):
+            self.ask_new_game()
+
+    def move(self, dx, dy):
+        if self.busy or self.talk or self.overlay:
+            return
+        a = self.area
+        x, y = self.pos[0] + dx, self.pos[1] + dy
+        if not a.inside(x, y):
+            if a.kind in ("town", "castle"):
+                self.leave_to_world()
+            else:
+                self.bump()
+            return
+        mob = a.mob_at(x, y)
+        if mob:
+            if mob.hostile:
+                self.attack(mob)
+                self.end_turn()
+            else:
+                self.start_talk(mob)
+            return
+        t = a.grid[y][x]
+        if t == "counter":
+            behind = a.mob_at(x + dx, y + dy)
+            if behind and not behind.hostile:
+                self.start_talk(behind)
+                return
+        if t == "lair" and "final_quest" not in self.flags:
+            self.say("A wall of enchanted ice seals the entrance to "
+                     "Moosedain's lair. Perhaps Lord Canadian knows a way "
+                     "in.", "info")
+            self.sound.play("bump")
+            return
+        if t not in WALKABLE:
+            self.bump()
+            return
+        self.pos = [x, y]
+        site = self.world["sites"].get((x, y)) if a.kind == "world" else None
+        if site:
+            self.enter_site(*site)
+            return
+        if t == "stairs_down":
+            self.change_level(1)
+            return
+        if t == "stairs_up":
+            self.change_level(-1)
+            return
+        if t == "chest":
+            self.open_chest(x, y)
+        elif t == "swamp" and not self.p["poison"] and random.random() < 0.15:
+            self.p["poison"] = True
+            self.say("The swamp's foul vapours poison you!", "bad")
+            self.sound.play("hurt")
+        self.end_turn()
+
+    def bump(self):
+        self.say("Blocked!", "info")
+        self.sound.play("bump")
+
+    def end_turn(self):
+        p, a = self.p, self.area
+        self.turn += 1
+        if a.kind == "world" or (a.kind == "dungeon" and self.turn % 2 == 0):
+            if p["food"] > 0:
+                p["food"] -= 1
+                if p["food"] == 0:
+                    self.say("You have run out of food!", "bad")
+                elif p["food"] == 30:
+                    self.say("Your food is running low.", "bad")
+            else:
+                p["hp"] -= 1
+                if self.turn % 6 == 0:
+                    self.say("You are starving!", "bad")
+        if p["poison"]:
+            p["hp"] -= 1
+            if random.random() < 0.05:
+                p["poison"] = False
+                self.say("The poison has worn off.", "good")
+        elif p["food"] > 0 and self.turn % 6 == 0 and p["hp"] < p["maxhp"]:
+            p["hp"] += 1
+        if p["hp"] <= 0:
+            self.die()
+            return
+        self.render()               # monsters chase what they can see
+        for mob in list(a.mobs):
+            if mob not in a.mobs:
+                continue
+            if mob.hostile:
+                self.monster_act(mob)
+                if p["hp"] <= 0:
+                    self.die()
+                    return
+            else:
+                self.wander(mob)
+        if a.kind == "world":
+            self.spawn_world()
+        elif a.kind == "dungeon":
+            self.spawn_dungeon()
+        self.render()
+
+    def can_go(self, mob, x, y):
+        a = self.area
+        if not a.inside(x, y) or a.mob_at(x, y) or [x, y] == self.pos:
+            return False
+        t = a.grid[y][x]
+        if MONSTERS[mob.kind].habitat == "water":
+            return t in WATER
+        if a.kind == "world":
+            return t in LAND
+        return t in DUNGEON_FLOOR
+
+    def monster_act(self, mob):
+        if "slow" in mob.traits and self.turn % 2:
+            return
+        px, py = self.pos
+        dx, dy = px - mob.x, py - mob.y
+        dist = abs(dx) + abs(dy)
+        if dist == 1:
+            self.monster_attack(mob)
+            return
+        if ("ranged" in mob.traits and (dx == 0 or dy == 0) and dist <= 6
+                and self.line_clear(self.area, mob.x, mob.y, px, py)
+                and random.random() < 0.35):
+            self.monster_ranged(mob)
+            return
+        chase = dist <= 10 and (dist <= 4 or (mob.x, mob.y) in self.visible)
+        if "erratic" in mob.traits and random.random() < 0.5:
+            chase = False
+        if chase:
+            steps = sorted(DIRS, key=lambda d: abs(px - mob.x - d[0]) +
+                           abs(py - mob.y - d[1]) + random.random() * 0.5)
+        elif random.random() < 0.5:
+            steps = [random.choice(DIRS)]
+        else:
+            return
+        for sx, sy in steps[:2]:
+            if self.can_go(mob, mob.x + sx, mob.y + sy):
+                mob.x += sx
+                mob.y += sy
+                return
+
+    def wander(self, mob):
+        if mob.roam is None or random.random() > 0.3:
+            return
+        dx, dy = random.choice(DIRS)
+        x, y = mob.x + dx, mob.y + dy
+        a = self.area
+        if (a.inside(x, y) and a.grid[y][x] in mob.roam
+                and not a.mob_at(x, y) and [x, y] != self.pos):
+            mob.x, mob.y = x, y
+
+    def spawn_world(self):
+        a = self.area
+        px, py = self.pos
+        a.mobs = [m for m in a.mobs if abs(m.x - px) + abs(m.y - py) <= 24]
+        if len(a.mobs) >= 6 or random.random() > 0.07:
+            return
+        for _ in range(10):
+            ang = random.random() * 2 * math.pi
+            r = random.uniform(6, 10)
+            x, y = px + round(r * math.cos(ang)), py + round(r * math.sin(ang))
+            if not a.inside(x, y) or a.mob_at(x, y):
+                continue
+            t = a.grid[y][x]
+            if t == "deep" and random.random() < 0.3:
+                kind = "serpent"
+            elif t in LAND:
+                cx, cy = self.world["castle"]
+                danger = min(6, 1 + int(math.hypot(x - cx, y - cy) // 8))
+                kind = random.choice([
+                    k for k, m in MONSTERS.items()
+                    if m.habitat in ("world", "both")
+                    and danger - 2 <= m.tier <= danger])
+            else:
+                continue
+            a.mobs.append(make_monster(kind, x, y))
+            return
+
+    def spawn_dungeon(self):
+        a = self.area
+        if len(a.mobs) >= 14 or random.random() > 0.02:
+            return
+        x, y = random.choice(a.floor)
+        if (x, y) in self.visible or a.mob_at(x, y) or [x, y] == self.pos:
+            return
+        d = self.world["dungeons"][a.key[1]]
+        a.mobs.append(make_monster(dungeon_monster(d, a.key[2]), x, y))
+
+    # ── Combat ──
+
+    def attack(self, mob):
+        p = self.p
+        roll = random.randint(1, 20) + p["level"] + p["dex"] // 4
+        if roll < 10 + mob.defense:
+            self.say("You miss %s." % self.the(mob), "info")
+            self.sound.play("miss")
+            return
+        self.flash(mob.x, mob.y)
+        if mob.kind == "moosedain" and p["weapon"] != "Maple Blade":
+            self.say("Your blow glances off Moosedain's enchanted hide! "
+                     "Only the Maple Blade can harm him.", "bad")
+            self.sound.play("miss")
+            return
+        dmg = max(1, random.randint(*WEAPONS[p["weapon"]].dmg) +
+                  (p["str"] - 10) // 3)
+        mob.hp -= dmg
+        if mob.hp > 0:
+            self.say("You hit %s. (%d)" % (self.the(mob), dmg))
+            self.sound.play("hit")
+            return
+        self.area.mobs.remove(mob)
+        gold = random.randint(0, mob.xp // 2 + 1)
+        if mob.boss:
+            gold += 50 * mob.level
+        p["xp"] += mob.xp
+        p["gold"] += gold
+        self.say("You kill %s! (%d xp%s)" % (
+            self.the(mob), mob.xp, ", %d gold" % gold if gold else ""),
+            "good")
+        self.sound.play("kill")
+        if mob.boss:
+            self.flags.add("boss:%d" % mob.dungeon)
+            d = self.world["dungeons"][mob.dungeon]
+            if d["artifact"]:
+                self.held.append(mob.dungeon)
+                self.say("You recover %s! Return it to Lord Canadian."
+                         % d["artifact"], "quest")
+                self.root.after(400, self.sound.play, "quest")
+            elif mob.kind == "moosedain":
+                self.flags.add("moosedain_dead")
+                self.say("Moosedain the Wicked is no more! Hasten back to "
+                         "Lord Canadian with the news.", "quest")
+                self.root.after(400, self.sound.play, "quest")
+            self.save()
+
+    def monster_attack(self, mob):
+        p = self.p
+        ac = ARMOURS[p["armor"]].ac
+        if random.randint(1, 20) + mob.level + 2 < 10 + ac + p["dex"] // 5:
+            self.say("%s misses you." % cap(self.the(mob)), "info")
+            return
+        dmg = max(1, random.randint(*mob.dmg) - ac // 3)
+        p["hp"] -= dmg
+        self.say("%s hits you! (%d)" % (cap(self.the(mob)), dmg), "bad")
+        self.flash(*self.pos)
+        self.sound.play("hurt")
+        if "poison" in mob.traits and not p["poison"] and \
+                random.random() < 0.3:
+            p["poison"] = True
+            self.say("You are poisoned!", "bad")
+
+    def monster_ranged(self, mob):
+        p = self.p
+        ac = ARMOURS[p["armor"]].ac
+        verb = ("hurls a bolt of dark magic" if mob.kind == "moosedain" else
+                "breathes fire" if mob.kind == "dragon" else "hurls fire")
+        self.sound.play("fire")
+        if random.randint(1, 20) + mob.level < 10 + ac + p["dex"] // 5:
+            self.say("%s %s, but misses." % (cap(self.the(mob)), verb),
+                     "info")
+            return
+        dmg = max(1, random.randint(*mob.dmg) - ac // 3)
+        p["hp"] -= dmg
+        self.say("%s %s! (%d)" % (cap(self.the(mob)), verb, dmg), "bad")
+        self.flash(*self.pos, tile="bolt")
+
+    def die(self):
+        self.busy = True
+        self.render()
+        self.say("You have died...", "bad")
+        self.sound.play("death")
+        self.root.after(1800, self.revive)
+
+    def resurrect(self):
+        p = self.p
+        p["hp"] = p["maxhp"]
+        p["poison"] = False
+        p["gold"] = 0
+        p["food"] = max(p["food"], 100)
+        self.cache = {k: v for k, v in self.cache.items()
+                      if k[0] != "dungeon"}
+        self.world_pos = list(self.world["castle"])
+        self.area = self.get_area(("castle",))
+        self.pos = [16, 6]
+
+    def revive(self):
+        self.resurrect()
+        self.busy = False
+        self.say("A warm light surrounds you... Lord Canadian has "
+                 "resurrected you. \"Sorry about that, eh!\" Your gold, "
+                 "alas, is lost.", "quest")
+        self.enter(self.area, self.pos, "level")
+
+    def open_chest(self, x, y):
+        _, di, level = self.area.key
+        key = "chest:%d:%d:%d,%d" % (di, level, x, y)
+        self.flags.add(key)
+        self.area.grid[y][x] = "dfloor"
+        rng = random.Random("%s:%s" % (self.world["seed"], key))
+        d = self.world["dungeons"][di]
+        gold = rng.randint(10, 30) * (d["tier"] + level)
+        self.p["gold"] += gold
+        msg = "You open the chest and find %d gold" % gold
+        if rng.random() < 0.3:
+            self.p["potions"] += 1
+            msg += " and a healing potion"
+        self.say(msg + "!", "gold")
+        self.sound.play("gold")
+
+    def drink(self):
+        if self.busy or self.talk or self.overlay:
+            return
+        p = self.p
+        if p["potions"] <= 0:
+            self.say("You have no potions!", "info")
+            return
+        p["potions"] -= 1
+        heal = min(p["maxhp"] - p["hp"], 15 + 5 * p["level"])
+        p["hp"] += heal
+        p["poison"] = False
+        self.say("You drink a healing potion. (+%d)" % heal, "good")
+        self.sound.play("potion")
+        self.end_turn()
+
+    # ── Conversation ──
+
+    def speaker(self, mob):
+        return mob.name if mob.known else cap(mob.title)
+
+    def npc_say(self, mob, text):
+        self.say("%s says: %s" % (self.speaker(mob), text), "talk")
+
+    def start_talk(self, mob):
+        self.talk = {"mob": mob, "mode": "kw"}
+        self.talkbar.pack(side="bottom", fill="x", before=self.log)
+        self.prompt.config(text="Your interest:")
+        self.entry.delete(0, "end")
+        self.entry.focus_set()
+        if mob.lord:
+            self.lord_greet(mob)
+            if self.overlay == "won":
+                self.end_talk()
+            return
+        self.say("You meet %s." % mob.title, "info")
+        self.npc_say(mob, mob.greet)
+        if "talked" not in self.flags:
+            self.flags.add("talked")
+            self.say("(Type a word such as NAME, JOB or NEWS and press "
+                     "Return. BYE, or an empty line, ends the "
+                     "conversation.)", "info")
+
+    def end_talk(self):
+        self.talk = None
+        self.talkbar.pack_forget()
+        self.canvas.focus_set()
+        if hasattr(self, "p"):
+            self.render()
+
+    def on_entry(self, ev=None):
+        text = self.entry.get().strip()
+        self.entry.delete(0, "end")
+        if not self.talk:
+            return
+        self.say("> " + (text or "bye"), "you")
+        self.converse(text.lower())
+
+    def converse(self, w):
+        t = self.talk
+        mob = t["mob"]
+        if t["mode"] == "buy":
+            t["mode"] = "kw"
+            self.prompt.config(text="Your interest:")
+            if w.isdigit():
+                self.buy(mob, int(w))
+                return
+            if not w:
+                self.npc_say(mob, "Anything else, then?")
+                return
+        if not w or w.startswith("bye"):
+            self.npc_say(mob, "Safe travels, and mind the geese!"
+                         if mob.lord else random.choice(BYES))
+            self.end_talk()
+            return
+        if w.startswith("name"):
+            mob.known = True
+        if mob.lord:
+            reply = self.lord_reply(w)
+        elif mob.shop and w[:3] in ("buy", "pur", "sho", "war", "goo"):
+            self.list_offers(mob)
+            return
+        else:
+            reply = next((v for k, v in mob.talk.items()
+                          if k[:4] == w.split()[0][:4]), None)
+        self.npc_say(mob, reply or random.choice((
+            "Sorry, I can't help thee with that.",
+            "I don't know anything about that, sorry.",
+            "Hmm? Sorry, I'm not sure what thou meanest.")))
+        self.render_chrome()
+
+    # ── Shops ──
+
+    def offers(self, mob):
+        s, p = mob.shop, self.p
+        if s["kind"] == "weapon":
+            return [("%s (%d-%d)" % ((n,) + WEAPONS[n].dmg), WEAPONS[n].price,
+                     "weapon", n) for n in s["stock"]]
+        if s["kind"] == "armor":
+            return [("%s (AC %d)" % (n, ARMOURS[n].ac), ARMOURS[n].price,
+                     "armor", n) for n in s["stock"]]
+        if s["kind"] == "healer":
+            return [("Healing potion", 25, "potion", None),
+                    ("Cure poison", 15, "cure", None),
+                    ("Heal all wounds", max(5, p["maxhp"] - p["hp"]),
+                     "heal", None)]
+        if s["kind"] == "inn":
+            return [("A room for the night", 8 + 4 * p["level"], "room",
+                     None)]
+        if s["kind"] == "tavern":
+            return [("Rations (50 meals)", 15, "food", None),
+                    ("A mug of ale", 2, "ale", None)]
+        return [("Rations (50 meals)", 18, "food", None),
+                ("Healing potion", 30, "potion", None)]
+
+    def list_offers(self, mob):
+        self.npc_say(mob, "Here's what I have:")
+        for i, (label, price, _, _) in enumerate(self.offers(mob), 1):
+            self.say("   %d) %-24s %5d gold" % (i, label, price), "gold")
+        self.say("You have %d gold." % self.p["gold"], "info")
+        self.talk["mode"] = "buy"
+        self.prompt.config(text="Which one (number)?")
+
+    def buy(self, mob, n):
+        p = self.p
+        offers = self.offers(mob)
+        if not 1 <= n <= len(offers):
+            self.npc_say(mob, "Sorry, I don't have that.")
+            return
+        label, price, kind, arg = offers[n - 1]
+        if kind == "weapon" and WEAPONS[arg].price <= \
+                WEAPONS[p["weapon"]].price:
+            self.npc_say(mob, "That's no better than thy %s!" % p["weapon"])
+            return
+        if kind == "armor" and ARMOURS[arg].price <= ARMOURS[p["armor"]].price:
+            self.npc_say(mob, "That's no better than thy %s!" % p["armor"])
+            return
+        if kind == "cure" and not p["poison"]:
+            self.npc_say(mob, "Thou art not poisoned. Lucky thee!")
+            return
+        if kind == "heal" and p["hp"] >= p["maxhp"]:
+            self.npc_say(mob, "Thou art not hurt.")
+            return
+        trade = 0
+        if kind == "weapon":
+            trade = WEAPONS[p["weapon"]].price // 2
+        elif kind == "armor":
+            trade = ARMOURS[p["armor"]].price // 2
+        cost = price - trade
+        if cost > p["gold"]:
+            self.npc_say(mob, "Sorry, thou canst not afford that.")
+            return
+        p["gold"] -= cost
+        self.sound.play("gold")
+        if kind == "weapon":
+            if trade:
+                self.npc_say(mob, "I'll take thy %s in trade, %d gold off."
+                             % (p["weapon"], trade))
+            p["weapon"] = arg
+            self.npc_say(mob, "Here is thy %s. Use it well!" % arg)
+        elif kind == "armor":
+            if trade:
+                self.npc_say(mob, "I'll take thy %s in trade, %d gold off."
+                             % (p["armor"], trade))
+            p["armor"] = arg
+            self.npc_say(mob, "Thy %s fits thee perfectly." % arg)
+        elif kind == "potion":
+            p["potions"] += 1
+            self.npc_say(mob, "One healing potion. Drink it with P.")
+        elif kind == "cure":
+            p["poison"] = False
+            self.npc_say(mob, "The poison is gone from thy blood.")
+        elif kind in ("heal", "room"):
+            p["hp"] = p["maxhp"]
+            self.npc_say(mob, "Thy wounds are healed." if kind == "heal" else
+                         "Thou sleepest soundly, and wakest refreshed.")
+            if kind == "room":
+                self.turn += 100
+        elif kind == "food":
+            p["food"] += 50
+            self.npc_say(mob, "Fifty meals of rations. Don't eat them all at "
+                         "once!")
+        elif kind == "ale":
+            t = self.world["towns"][self.area.key[1]] \
+                if self.area.kind == "town" else None
+            here = (t["x"], t["y"]) if t else self.world["castle"]
+            self.npc_say(mob, "Cheers! Here's what I hear: " +
+                         random.choice(town_rumours(self.world, here)))
+        self.render_chrome()
+
+    # ── Lord Canadian ──
+
+    def lord_greet(self, mob):
+        p = self.p
+        self.say("You kneel before Lord Canadian.", "info")
+        for di in list(self.held):
+            d = self.world["dungeons"][di]
+            self.held.remove(di)
+            self.returned.add(di)
+            gold, xp = 150 * d["tier"], 100 * d["tier"]
+            p["gold"] += gold
+            p["xp"] += xp
+            self.npc_say(mob, "Thou hast recovered %s! Canada... er, %s "
+                         "thanks thee. Take this reward of %d gold." % (
+                             d["artifact"], self.world["realm"], gold),
+                         )
+            self.say("(+%d xp, +%d gold)" % (xp, gold), "good")
+            self.sound.play("quest")
+        raised = False
+        while p["level"] < MAX_LEVEL and p["xp"] >= xp_needed(p["level"]):
+            p["level"] += 1
+            gain = random.randint(8, 12)
+            p["maxhp"] += gain
+            p["str"] += random.randint(1, 2)
+            p["dex"] += random.randint(1, 2)
+            raised = True
+            self.say("Thou art now level %d! (+%d max HP)" % (p["level"],
+                                                              gain), "quest")
+        if raised:
+            self.root.after(300, self.sound.play, "level")
+        if p["hp"] < p["maxhp"] or p["poison"]:
+            p["hp"] = p["maxhp"]
+            p["poison"] = False
+            self.say("Lord Canadian lays his hands upon thee. Thy wounds "
+                     "are healed.", "good")
+        if "moosedain_dead" in self.flags and "won" not in self.flags:
+            self.flags.add("won")
+            self.npc_say(mob, "Moosedain is defeated! %s is saved! I "
+                         "declare a holiday, with fireworks and pancakes. "
+                         "And sorry it took so long to thank thee properly."
+                         % self.world["realm"])
+            self.overlay = "won"
+            self.root.after(300, self.sound.play, "quest")
+            self.save()
+            return
+        self.npc_say(mob, "Welcome, %s! How may I help thee, eh? (Ask me "
+                     "about thy QUEST.)" % p["name"])
+        self.save()
+
+    def current_quest(self):
+        for di in self.world["quests"]:
+            if di not in self.returned:
+                return di
+        return None
+
+    def lord_reply(self, w):
+        p, world = self.p, self.world
+        k = w.split()[0][:4]
+        castle = world["castle"]
+        if k == "name":
+            return "I am Lord Canadian, ruler of %s. Sorry, I should have " \
+                   "introduced myself sooner." % world["realm"]
+        if k == "job":
+            return "I rule this fair and chilly land. Mostly I apologise " \
+                   "to people. Thou couldst help me with a QUEST."
+        if k in ("ques", "miss", "task"):
+            di = self.current_quest()
+            if di is not None:
+                d = world["dungeons"][di]
+                held = " Thou hast it already, it seems: bring it here!" \
+                    if di in self.held else ""
+                n = len(self.returned)
+                return ("%s relics were stolen by the minions of MOOSEDAIN; "
+                        "%d of 4 are home again. %s has carried off %s to "
+                        "%s, %s of my castle. Recover it, I beg thee!%s" % (
+                            "Four", n, d["boss"], d["artifact"], d["name"],
+                            where(castle, (d["x"], d["y"])), held))
+            lair = world["dungeons"][5]
+            spot = where(castle, (lair["x"], lair["y"]))
+            if "final_quest" not in self.flags:
+                self.flags.add("final_quest")
+                if WEAPONS[p["weapon"]].price < WEAPONS["Maple Blade"].price:
+                    p["weapon"] = "Maple Blade"
+                self.sound.play("quest")
+                self.save()
+                return ("All four relics are home! From their power I have "
+                        "forged the MAPLE BLADE: take it, for only it can "
+                        "harm Moosedain. His lair lies %s. The ice that "
+                        "sealed it has melted. Go, and end his wickedness!"
+                        % spot)
+            return "Moosedain's lair lies %s. Only the Maple Blade can " \
+                   "harm him. Go!" % spot
+        if k in ("moos", "evil", "enem"):
+            return "Moosedain the Wicked, a sorcerer with the head of a " \
+                   "moose and the manners of a goose. He sends his minions " \
+                   "to plunder my realm. Only the MAPLE BLADE can harm him."
+        if k == "mapl":
+            return "The Maple Blade can be forged only from the power of " \
+                   "the four stolen relics. Ask me about thy QUEST."
+        if k in ("heal", "help"):
+            return "I have healed thee. Always happy to help, eh?"
+        if k in ("leve", "expe", "trai"):
+            if p["level"] >= MAX_LEVEL:
+                return "Thou art as mighty as any hero can be!"
+            return "Return when thou hast gained experience and I shall " \
+                   "raise thy level. Thou needest %d more experience." % (
+                       xp_needed(p["level"]) - p["xp"])
+        if k in ("cana", world["realm"].lower()[:4]):
+            return "True north, strong and... well, chilly."
+        if k == "syru":
+            return "Never trust a man with no syrup on his pancakes."
+        if k == "sorr":
+            return "No, I'm sorry."
+        if k == "hock":
+            return "The royal team hasn't won the cup in years. Sorry."
+        if k == "brit":
+            return "Lord who? Some fellow across the sea, I believe. Never " \
+                   "heard of him. He sounds very sure of himself."
+        return None
+
+    # ── Drawing ──
+
+    def layout(self):
+        """(Re)build the grid of canvas items to fit the canvas."""
+        if not hasattr(self, "area"):
+            return
+        c = self.canvas
+        c.delete("all")
+        ts = 16 * self.scale
+        W, H = max(c.winfo_width(), ts * 5), max(c.winfo_height(), ts * 5)
+        cols, rows = W // ts, H // ts
+        cols -= 1 - cols % 2
+        rows -= 1 - rows % 2
+        ox, oy = (W - cols * ts) // 2, (H - rows * ts) // 2
+        self.view = (cols, rows, ox, oy, ts)
+        self.cells = []
+        for j in range(rows):
+            for i in range(cols):
+                x, y = ox + i * ts, oy + j * ts
+                self.cells.append((
+                    c.create_image(x, y, anchor="nw", state="hidden"),
+                    c.create_image(x, y, anchor="nw", state="hidden")))
+        self.shown = [(None, None)] * len(self.cells)
+        self.fx = c.create_image(0, 0, anchor="nw", state="hidden")
+        self.render()
+
+    @staticmethod
+    def line_clear(a, x0, y0, x1, y1):
+        """True if nothing opaque lies strictly between the two squares."""
+        dx, dy = abs(x1 - x0), -abs(y1 - y0)
+        sx, sy = (1 if x0 < x1 else -1), (1 if y0 < y1 else -1)
+        err = dx + dy
+        x, y = x0, y0
+        while (x, y) != (x1, y1):
+            if (x, y) != (x0, y0) and a.grid[y][x] in a.opaque:
+                return False
+            e2 = 2 * err
+            if e2 >= dy:
+                err += dy
+                x += sx
+            if e2 <= dx:
+                err += dx
+                y += sy
+        return True
+
+    def compute_visible(self):
+        a = self.area
+        cols, rows = self.view[0], self.view[1]
+        px, py = self.pos
+        r2 = LIGHT_RADIUS ** 2 if a.dark else None
+        vis = set()
+        for y in range(max(0, py - rows // 2), min(a.h, py + rows // 2 + 1)):
+            for x in range(max(0, px - cols // 2),
+                           min(a.w, px + cols // 2 + 1)):
+                if r2 and (x - px) ** 2 + (y - py) ** 2 > r2:
+                    continue
+                if self.line_clear(a, px, py, x, y):
+                    vis.add((x, y))
+                    a.seen[y * a.w + x] = 1
+        return vis
+
+    def render(self):
+        if not self.cells:
+            return
+        c, a = self.canvas, self.area
+        cols, rows = self.view[0], self.view[1]
+        px, py = self.pos
+        self.visible = vis = self.compute_visible()
+        mobs = {(m.x, m.y): m for m in a.mobs}
+        x0, y0 = px - cols // 2, py - rows // 2
+        for j in range(rows):
+            y = y0 + j
+            for i in range(cols):
+                x = x0 + i
+                base = top = None
+                if a.inside(x, y):
+                    if (x, y) in vis:
+                        base = a.grid[y][x]
+                        m = mobs.get((x, y))
+                        if m:
+                            top = m.tile
+                    elif a.dark and a.seen[y * a.w + x]:
+                        base = "~" + a.grid[y][x]
+                elif a.edge:
+                    base = a.edge
+                if x == px and y == py:
+                    top = "avatar"
+                idx = j * cols + i
+                old = self.shown[idx]
+                if old == (base, top):
+                    continue
+                self.shown[idx] = (base, top)
+                bid, tid = self.cells[idx]
+                if base != old[0]:
+                    if base is None:
+                        c.itemconfig(bid, state="hidden")
+                    elif base[0] == "~":
+                        c.itemconfig(bid, image=self.dimg[base[1:]],
+                                     state="normal")
+                    else:
+                        c.itemconfig(bid, image=self.img[base],
+                                     state="normal")
+                if top != old[1]:
+                    if top is None:
+                        c.itemconfig(tid, state="hidden")
+                    else:
+                        c.itemconfig(tid, image=self.img[top], state="normal")
+        c.delete("overlay")
+        if self.overlay == "map":
+            self.draw_map()
+        elif self.overlay == "help":
+            self.draw_text_box(HELP)
+        elif self.overlay == "won":
+            self.draw_text_box(
+                "VICTORY!\n\nMoosedain the Wicked is no more, and %s is "
+                "saved.\n\nLord Canadian has declared a national holiday,\n"
+                "and apologises for any inconvenience.\n\nYou finished at "
+                "level %d after %d turns.\n\nPress N for a new world, or "
+                "Escape to keep wandering." % (
+                    self.world["realm"], self.p["level"], self.turn),
+                ACCENT)
+        self.render_chrome()
+
+    def flash(self, x, y, tile="hit"):
+        cols, rows, ox, oy, ts = self.view
+        i = x - self.pos[0] + cols // 2
+        j = y - self.pos[1] + rows // 2
+        if not (0 <= i < cols and 0 <= j < rows):
+            return
+        self.fx_token += 1
+        token = self.fx_token
+        self.canvas.coords(self.fx, ox + i * ts, oy + j * ts)
+        self.canvas.itemconfig(self.fx, image=self.img[tile], state="normal")
+        self.canvas.tag_raise(self.fx)
+
+        def hide():
+            if token == self.fx_token:
+                self.canvas.itemconfig(self.fx, state="hidden")
+        self.root.after(160, hide)
+
+    def draw_text_box(self, text, color=INK):
+        c = self.canvas
+        W, H = c.winfo_width(), c.winfo_height()
+        t = c.create_text(W / 2, H / 2, text=text, fill=color, font=MONO,
+                          justify="left", tags="overlay")
+        x0, y0, x1, y1 = c.bbox(t)
+        r = c.create_rectangle(x0 - 20, y0 - 16, x1 + 20, y1 + 16,
+                               fill=PANEL, outline=ACCENT, width=2,
+                               tags="overlay")
+        c.tag_raise(t, r)
+
+    def draw_map(self):
+        c, a = self.canvas, self.world_area
+        W, H = c.winfo_width(), c.winfo_height()
+        rows = []
+        for y in range(WORLD_H):
+            row = []
+            for x in range(WORLD_W):
+                if not a.seen[y * WORLD_W + x]:
+                    row.append("#000000")
+                else:
+                    t = a.grid[y][x]
+                    row.append(SITE_COLORS.get(t) or self.avg[t])
+            rows.append("{" + " ".join(row) + "}")
+        img = tk.PhotoImage(width=WORLD_W, height=WORLD_H)
+        img.put(" ".join(rows))
+        z = max(1, int(min(W, H - 40) * 0.9) // WORLD_W)
+        self.map_img = img.zoom(z)
+        c.create_rectangle(0, 0, W, H, fill="black", tags="overlay")
+        mx, my = (W - WORLD_W * z) / 2, (H - WORLD_H * z) / 2 + 10
+        c.create_image(mx, my, image=self.map_img, anchor="nw",
+                       tags="overlay")
+        px, py = self.pos if self.area.kind == "world" else self.world_pos
+        c.create_rectangle(mx + px * z - 2, my + py * z - 2,
+                           mx + (px + 1) * z + 2, my + (py + 1) * z + 2,
+                           outline="#ffff00", width=2, tags="overlay")
+        c.create_text(W / 2, my - 14, fill=ACCENT, font=MONO, tags="overlay",
+                      text="Map of %s   (white: castle, red: towns, orange: "
+                      "dungeons; any key closes)" % self.world["realm"])
+
+    def render_chrome(self):
+        p = self.p
+        self.status.config(text=cap(self.area.name))
+        self.turns.config(text="Turn %d" % self.turn)
+        need = ("%d" % xp_needed(p["level"]) if p["level"] < MAX_LEVEL
+                else "max")
+        lines = [p["name"], "",
+                 "Level   %d" % p["level"],
+                 "HP      %d/%d" % (max(0, p["hp"]), p["maxhp"]),
+                 "Str     %d" % p["str"],
+                 "Dex     %d" % p["dex"],
+                 "XP      %d/%s" % (p["xp"], need),
+                 "Gold    %d" % p["gold"],
+                 "Food    %d" % p["food"],
+                 "Potions %d" % p["potions"], "",
+                 "Weapon", "  %s (%d-%d)" % ((p["weapon"],) +
+                                              WEAPONS[p["weapon"]].dmg),
+                 "Armour", "  %s (AC %d)" % (p["armor"],
+                                             ARMOURS[p["armor"]].ac), "",
+                 "Relics  %d/4" % len(self.returned)]
+        for di in self.world["quests"]:
+            d = self.world["dungeons"][di]
+            mark = ("+" if di in self.returned else
+                    "*" if di in self.held else "-")
+            lines.append(" %s %s" % (mark, d["artifact"][4:]))
+        if "moosedain_dead" in self.flags:
+            lines += ["", "Moosedain is slain!"]
+        elif "final_quest" in self.flags:
+            lines += ["", "Slay Moosedain!"]
+        self.panel.config(text="\n".join(lines))
+        cond = []
+        if p["poison"]:
+            cond.append("POISONED")
+        if p["food"] <= 0:
+            cond.append("STARVING")
+        if 0 < p["hp"] <= p["maxhp"] // 4:
+            cond.append("BADLY HURT")
+        self.condition.config(text="\n".join(cond))
+        self.btn["mute"].config(
+            text="Sound: off" if self.sound.muted else "Sound: on")
+
+    # ── Commands ──
+
+    def toggle_map(self):
+        if self.busy or self.talk:
+            return
+        self.overlay = None if self.overlay == "map" else "map"
+        self.render()
+
+    def show_help(self):
+        if self.busy or self.talk:
+            return
+        self.overlay = None if self.overlay == "help" else "help"
+        self.render()
+
+    def zoom(self, d):
+        s = min(4, max(1, self.scale + d))
+        if s != self.scale:
+            self.scale = s
+            self.scale_images()
+            self.layout()
+
+    def toggle_mute(self):
+        self.sound.muted = not self.sound.muted
+        self.render_chrome()
+
+    def ask_new_game(self):
+        if self.busy:
+            return
+        if "won" in self.flags or messagebox.askyesno(
+                "New game", "Abandon this game and start again in a whole "
+                "new world?", parent=self.root):
+            self.new_game()
+
+
+# ------------------------------------------------ icon / macOS app bundle
+
+ICON_NAME = "penultimate"
+ICON_DOC_EXTS = []
+ICON_SKY_TOP = (24, 32, 84)
+ICON_SKY_BOTTOM = (140, 70, 120)
+ICON_STONE = (168, 166, 176)
+ICON_SHADE = (120, 118, 130)
+
+
+def icon_art(x, y):
+    """A castle with a red pennant on a green hill, against a dusk sky."""
+    if y > 0.80 - 0.06 * math.cos((x - 0.5) * 3):
+        return (46, 122, 52)
+    if 0.495 <= x <= 0.515 and 0.10 <= y <= 0.40:            # flagpole
+        return (60, 50, 40)
+    if 0.515 < x <= 0.68 and 0.11 <= y <= 0.11 + 0.10 * (0.68 - x) / 0.165:
+        return (214, 40, 50)                                  # pennant
+    stone = None
+    if 0.28 <= x <= 0.72 and 0.45 <= y:                       # keep
+        stone = ICON_STONE
+    elif 0.28 <= x <= 0.72 and 0.40 <= y and int((x - 0.28) / 0.055) % 2 == 0:
+        stone = ICON_STONE
+    for x0 in (0.14, 0.70):                                   # towers
+        if x0 <= x <= x0 + 0.16:
+            if 0.30 <= y or (0.24 <= y and int((x - x0) / 0.04) % 2 == 0):
+                stone = ICON_SHADE if x > x0 + 0.11 else ICON_STONE
+    if stone:
+        if 0.43 <= x <= 0.57 and (y >= 0.64 or
+                                  math.hypot(x - 0.5, y - 0.64) <= 0.07):
+            return (34, 26, 20)                               # gate
+        for wx in (0.20, 0.76):
+            if wx <= x <= wx + 0.04 and 0.40 <= y <= 0.48:
+                return (34, 26, 20)                           # windows
+        return stone
+    t = min(max(y / 0.8, 0.0), 1.0)
+    return tuple(int(ICON_SKY_TOP[i] + (ICON_SKY_BOTTOM[i] - ICON_SKY_TOP[i])
+                     * t) for i in range(3))
+
+
+def icon_rr(x, y, x0, y0, x1, y1, r):
+    """True inside the rounded rectangle (x0,y0)-(x1,y1) with corner radius r."""
+    cx = min(max(x, x0 + r), x1 - r)
+    cy = min(max(y, y0 + r), y1 - r)
+    return math.hypot(x - cx, y - cy) <= r
+
+
+def icon_sample(x, y):
+    """RGB of the icon at (x, y) in the unit square, or None (transparent)."""
+    if not icon_rr(x, y, 0.0, 0.0, 1.0, 1.0, 0.2):
+        return None
+    return icon_art(x, y)
+
+
+def icon_render_png(size):
+    n = 4 if size <= 256 else 2
+    rows = []
+    for py in range(size):
+        row = bytearray([0])                     # PNG filter type 0
+        for px in range(size):
+            ra = ga = ba = aa = 0
+            for sy in range(n):
+                for sx in range(n):
+                    c = icon_sample((px + (sx + 0.5) / n) / size,
+                                    (py + (sy + 0.5) / n) / size)
+                    if c:
+                        ra += c[0]
+                        ga += c[1]
+                        ba += c[2]
+                        aa += 1
+            if aa:
+                row += bytes((ra // aa, ga // aa, ba // aa,
+                              255 * aa // (n * n)))
+            else:
+                row += b"\0\0\0\0"
+        rows.append(bytes(row))
+
+    def chunk(tag, data):
+        return (struct.pack(">I", len(data)) + tag + data +
+                struct.pack(">I", zlib.crc32(tag + data) & 0xffffffff))
+    return (b"\x89PNG\r\n\x1a\n" +
+            chunk(b"IHDR", struct.pack(">IIBBBBB", size, size, 8, 6, 0, 0, 0)) +
+            chunk(b"IDAT", zlib.compress(b"".join(rows), 9)) +
+            chunk(b"IEND", b""))
+
+
+# ICNS entry types holding PNG data, with the pixel size of each
+ICON_ICNS_TYPES = [(b"icp4", 16), (b"icp5", 32), (b"ic11", 32), (b"ic12", 64),
+                   (b"ic07", 128), (b"ic13", 256), (b"ic08", 256),
+                   (b"ic14", 512), (b"ic09", 512)]
+
+
+def icon_make_icns():
+    """An .icns file written directly (no iconutil needed)."""
+    pngs = {}
+    body = b""
+    for tag, size in ICON_ICNS_TYPES:
+        if size not in pngs:
+            pngs[size] = icon_render_png(size)
+        body += tag + struct.pack(">I", len(pngs[size]) + 8) + pngs[size]
+    return b"icns" + struct.pack(">I", len(body) + 8) + body
+
+
+def icon_build_app(dest):
+    """Build a macOS <name>.app bundle (with icon) in dest."""
+    app = os.path.join(dest, ICON_NAME + ".app")
+    if os.path.exists(app):
+        shutil.rmtree(app)
+    macos = os.path.join(app, "Contents", "MacOS")
+    res = os.path.join(app, "Contents", "Resources")
+    os.makedirs(macos)
+    os.makedirs(res)
+    shutil.copy(os.path.abspath(__file__), os.path.join(res, ICON_NAME + ".py"))
+    launcher = os.path.join(macos, ICON_NAME)
+    with open(launcher, "w") as fh:
+        fh.write('#!/bin/sh\nexec "%s" "$(dirname "$0")/../Resources/%s.py" '
+                 '"$@"\n' % (sys.executable, ICON_NAME))
+    os.chmod(launcher, 0o755)
+    with open(os.path.join(res, ICON_NAME + ".icns"), "wb") as fh:
+        fh.write(icon_make_icns())
+    info = {
+        "CFBundleName": ICON_NAME,
+        "CFBundleDisplayName": ICON_NAME,
+        "CFBundleIdentifier": "org.badgerjh." + ICON_NAME,
+        "CFBundleExecutable": ICON_NAME,
+        "CFBundleIconFile": ICON_NAME,
+        "CFBundlePackageType": "APPL",
+        "CFBundleShortVersionString": "1.0",
+        "NSHighResolutionCapable": True,
+    }
+    if ICON_DOC_EXTS:
+        info["CFBundleDocumentTypes"] = [{
+            "CFBundleTypeName": ICON_NAME + " file",
+            "CFBundleTypeRole": "Viewer",
+            "CFBundleTypeExtensions": ICON_DOC_EXTS}]
+    with open(os.path.join(app, "Contents", "Info.plist"), "wb") as fh:
+        plistlib.dump(info, fh)
+    return app
+
+
+def icon_args(args):
+    """Handle --build-app [DIR] and --icon-png SIZE [OUT]; True if handled."""
+    if args[:1] == ["--build-app"]:
+        print(icon_build_app(args[1] if len(args) > 1 else
+                             os.path.dirname(os.path.abspath(__file__))))
+        return True
+    if args[:1] == ["--icon-png"] and len(args) >= 2:
+        with open(args[2] if len(args) > 2 else ICON_NAME + ".png", "wb") as fh:
+            fh.write(icon_render_png(int(args[1])))
+        return True
+    return False
+
+
+def set_window_icon(root):
+    try:
+        root._icon = tk.PhotoImage(data=ICON_PNG)
+        root.iconphoto(True, root._icon)
+    except tk.TclError:
+        pass
+
+
+# ── ICON DATA BEGIN
+ICON_PNG = (
+    "iVBORw0KGgoAAAANSUhEUgAAAIAAAACACAYAAADDPmHLAAAKGklEQVR42u2aW1MbRxqGv3/A"
+    "zV5ks0mwwSDZjsFgbM4IY2yMsZEPgDjZAnzgDEacfZJD4mCS2JtQm8ru2tlKdrdSudnS3uy1"
+    "Ktd7v7f8BH7Ct90qDoM0IyTx9mik6al6uly4h/76ex+NRhqIgMcHx7p8grAgIogKWAMhutNT"
+    "2VsfOen4/bGuoCAiYI2tyJ4HsxL6H453F3wobBRsCViTVWQGYZmJLeF/dLw7KBbbFrDGUWzL"
+    "bJQF//Hx7kKxQFTAGkcTlVlBw/+kqNsvfum2gDU5wbbMDBJ+YVFP8JOiHtbkHjK7I4V/rKgn"
+    "LGBNThPOKPzjxT1BAWvygvSuBEXFAb+ANXlFavcEJ4oDhcXFgW0Ba/KKbZnt4QKcCEQFrMlL"
+    "oknDLznRGxSwWzhZ6ufTnusxXLRv8/sBT0lvQemJ3m0Bu4ULZVXcUOmN4aJ9b8usEwTwlvSG"
+    "Bewmqg0C/M9bCeO/nipeKG1z8t4TPxqeLOnbErCbUCHA96XNfK6kx+l73zoQ/qmSvqCA3QZS"
+    "gP94arlb3FPk0P737wVOl/ZHBOw2qsuPLoC83C+VXs3F/Uf2BPhU/MCN1BxRgJ89TVxdGsjZ"
+    "/cfCP+Pp9wnYjWQqwG+eag54buZDD3xU5hkIC9iNpCuAvNyvea7kUw/CVO4ZiAjYjaQjwN+9"
+    "Tdzq6c63HkSowjsQFbAbqU1BgN+81dzvvZWvPYhSpXeQ3Upt+fmkAnzhbcv7HtA5MbgVKwH+"
+    "5W3gNm+PK3pAVScH2a3UxQkgL/ejXr+rekDnT95lt2IU4JW43Pu8/a7rAV04dZfdSt3ZfQHc"
+    "2gOqFoNbMQrg1h5Qzal77FbqDQK4tQdUd/oeI+huDyVgNq+zZfrAnPbGUW4sH2JUHelgFEDl"
+    "Om11Ywm9kX2In9dcef/AnNtXZmP9UVkb1ctGAPj1l38nYDbvm/V3B+asLK3xNbFJVB1pYRBA"
+    "5TpzY+sJvZF9iJ/X0z5/YM77v/4z1h+VtVHD6SAjMBPAbN4bEwE6mkYZVUdaGARQuU7IRADZ"
+    "h/h5gWvmAqisjRo/DTICMwHM5pkJcF0IgKojHYwCqFwnNG4uQPy8XgsBVNZGTWJAYCaA2Txz"
+    "AcYYVUc6GAVQuc68hQDx86wEUFkb+c4MMQIzAczmvVl/nyDADd8Yo+pIh4azF/YEULnO/Phr"
+    "EwHeJ8zr61gwFUBlbdQsBgRmApjNe2siQKcQAFVHOjQaBFC5zoKJALIP8fP6LQRQWRu1nBlm"
+    "BGYCmM0zE8DvG2dUHelgFEDlOosWAsTPG7AQQGVtdKlsmBGYCbA48TqBdz/8kiDAg4FFvnt7"
+    "7gA3m8cZVZsVjRX7AqhcR+47vjeyD/G9WVvdNBUgvjcSVG3UKgYEZgKkgtygGffEJlG1WdFk"
+    "EEDlOksmAqTCrgBmoGqjy2UjjAAvQIhRtVlhFEDlOksTG3ABULXRlfIRRoAWICgEQNVmhVEA"
+    "lessKxAAVRu1iQGBCgFQtVlhFEDlOioEQNVGV8/eZwRoAYbuhBhVmxU+gwAq11mZxAuAqo3a"
+    "xYBAhQCo2qwwCqByHRUCoGqjDjEgQAswLARA1WaFUQCV66wqEABVG12veMAI0AKM3JlnVG1W"
+    "NFdU7wmgcp0nk1/BBUDVRjfEgECFAKjarDAKoHIdFQKgaqNOMSBAC3BfCICqzQqjACrXeapA"
+    "AFRt5K98yAjgAnTNM6o2K5or9wVQuc7TKbwAqNrophgQoAV4IARA1WbFRYMAKtd5pkAAVG10"
+    "SwwIkm1kcW6RLzXWH2Aw0JtUgFfhP/Lmxo8HSLZ+/NxUzrtR2c9vNt7GSOe8dNc7TADZi/j+"
+    "yJ4lEwCVG90594gRJNvgw6ERLvrwdweQm0wmwLdv/5LwezJdP9vnPZ/6Oul82Yv4/sieJRMA"
+    "lRt1iQGBHQJkun62z3uhQABUbtRdNcoI7BAg0/Wzfd6LabwAqNyoRwwI7BAg0/WzfV5YgQCo"
+    "3CggBgR2CJDp+tk+T4UAqNyo9/wYI7BDgJfT31iSbP1sn/enjb/BBUDlRn1iQGCHAPlKJgKg"
+    "cqN+MSDQAtgrACo3Grwwzgi0APYKgMqN7ooBQbINfvn5RmxDRuQ3XVqA/W9K4/sje5ZMAFRu"
+    "dK96nBGgnwW4SYBMngWgcqNg9QQj0ALYKwAqNxoSAwItgL0CoHKj4ZoJRqAFsFcAVG40UjPJ"
+    "CLQA9gqAyo0eiAGBFsBeAVC50cPaSUagBbBXAFRu9Kh2ihFoAewVAJUbjdZNMQItgL0CoHKj"
+    "sbppRqAFsFcAVG40LgYEWgB7BUDlRhP104wgVwSQ37t3XG7lU0Uf7z14kf+WP9t9PpELAqBy"
+    "o8n6GUbgdAHefr3J9VUVCU/d4pFz5FynC4DKjabFgMDJAsgna8ZX/GHIufIcJwuAyo1mGmYY"
+    "gVMFkK/mdMI3SpDtK0EyAVC50WzDLCNwqgBmf2yRKrt/tOJEAVC50WMxIHCiAPIynmn4u2Tz"
+    "rSCZAKjcaK5xlhE4UYCuzs4jCyB/hxMFQOVGocbHjMCJAqRy15/KpwInCoDKjeabHjMCJwpw"
+    "1PB3caIAqNxoUQwItAD2CoDKjZaa5hiBFsBeAVC50bJvjhFoAewVAJUbrYgBgRbAXgFQudGq"
+    "L8QItAD2CoDKjZ40hxiBFsBeAVC50VMxINAC2CsAKjd6dnGeEWgB7BUAlRu9EAMCLYC9AqBy"
+    "o/DFBUagBbBXAFRu9LJlgRFoAewVAJUbfSYGBFoAewVA5UZrLYuMwIkCFJd+wCWVHx0J+Tuc"
+    "KAAqN/r80iIjUCXAdz/+mTfefRdj8tvQHl3r/Xz91Z09yp5U2YpxbVmLsbbdemXtqgRA5UZf"
+    "iAFBJhuUDXq4PMOB5SDfWRng9pVb3LzaxvWrLbYHqprWtY6YLANfjcQkCW2uHipJMgFQudGX"
+    "rUuMwGwDP/3j19gmn3z/WWzTcvOyCeef1eddwEdF9sQoiOzZy83XPL/03FQAVG60LoajstQ5"
+    "vneJ1iHjqVytiV0Z5RVSXinlVVP2HJEdvRZDqiyLRSe7hnkg2M3Xxq9y02yzDijLyAxkFjIT"
+    "mY3MKJ1MaePyMsfzvGOGQ7cf7QXte6yDzjVkZrtiyCxlpmZZ07z4z+HBPu4ZucWXp1p18/Ic"
+    "mbHMWmYusyfdFHejBdAC6Ca4XYCoboRriUoBIroRriUiBQjrRriWsBTApxvhWnwkD90Il94A"
+    "7h76PsCl7/8GAYK6Ia4jSMZD/GBLN8U1bFH8oT8NuOzu30SAAsG2bk7eIzMuILND3wu48L3f"
+    "RAL91XA+f/V72CEmFeq3gry99BdSKoeY6NcNyzv8lM6h7wdc9L6fRAL90TAfP/LpK4F+5acr"
+    "gV/fGObcDZ+fkMfOpwP9ETEHPuqlfLd/hLcEfTVw5qs+SHYcO18bh/UDJGc82NnJooCycexc"
+    "EfTfE2Theb5tr/g0ZPDt2BjR9wvw9/XITm99yMz+D+cHbc9B3r1mAAAAAElFTkSuQmCC"
+)
+# ── ICON DATA END
+
+# Tile graphics: 16x16 PNGs, generated from the pixel art in make_tiles.py
+# ── TILE DATA BEGIN
+TILE_PNG = {
+    "deep": (
+        "iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAASElEQVR42mOQMGj4TwlmoKoB"
+        "GlH74JhkA9A1EWsIA13DAJsXGUjRjI3PMLiikZzoZCDWr4MjGrEaQGrSRQ8nBlKTLrpair0A"
+        "APJN0OiZGCG5AAAAAElFTkSuQmCC"
+    ),
+    "water": (
+        "iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAARElEQVR42mPQiNr3nxLMQFUD"
+        "8pZ+AGOyDEDWSIohDHQLA1zeYyBWMy7vMQyuaCQnKhmI9evARyMubzKQmnTRvTnw0QgAEPdM"
+        "EvPX574AAAAASUVORK5CYII="
+    ),
+    "grass": (
+        "iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAATUlEQVR42mOw6rf6TwlmQBfI"
+        "2xdAmQH4sEqKBm4DsElSxQWEvMRAlUDEZgshL8HkGagejaSGBQOpTqdNIJLiZHQX0j4h0SQz"
+        "Iauh2AUAiWMDKdWjAtYAAAAASUVORK5CYII="
+    ),
+    "forest": (
+        "iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAAg0lEQVR42mOw6rf6D8MqKRoo"
+        "GFkOF2ZA15y3LwCnIdgsYMCnGVkhLjUM2EzGZQA2C0gyABtmwOU/ksKA2FgAiUVZSKHIMaAr"
+        "AikAYVwGo8sxYItbZEX4YghrOiAm6nDGAj6FBA0gRzNGSiQlDeDMC/iiEVsMMRBSgC+GcKYD"
+        "YrIxDAMAUVbW/I1uM+0AAAAASUVORK5CYII="
+    ),
+    "hills": (
+        "iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAAY0lEQVR42mOw6rf6TwlmoJkB"
+        "DT0ecEyyATCNefsCCBrEQKxmEI7LMMJvAD7NuAxhwOZnQhjZEAa6RCO+gGQgpAhbuGAYgE0R"
+        "zJ+4AhYmz0Ao2vDFCkiegZTQx4YZBm9mIhYDAJtdHurchO6jAAAAAElFTkSuQmCC"
+    ),
+    "mountain": (
+        "iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAAeklEQVR42p2Ryw0AIQhEqctK"
+        "qInLluyGAxtgYfyYTIzG99QMjWfMKsw8dejcndEQgm0gCSFYRJYSyrBBOltsXUlKAUqWEIK7"
+        "vZ+gO9i9yEtKQQf7ak1Cu7BvxLdSChCcqw0C9OdufylA1QbB6e1BcAOXX9htw+d7wW1eWW1t"
+        "NLys1pkAAAAASUVORK5CYII="
+    ),
+    "swamp": (
+        "iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAAa0lEQVR42mPwSbH5TwlmgDFS"
+        "IqzAmJCGvH0BmAbANBNjCFYDiHUBTDOyIQxUCwNCTsXlRQZinIoeRsiGEO0FvC5Ady7JYYAt"
+        "dPHZSlQg4vM3UQYQcgHMtWSlA2Qvk5wXsHoBn18JxRDFLgAA7tn0bOQgZMUAAAAASUVORK5C"
+        "YII="
+    ),
+    "sand": (
+        "iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAARUlEQVR42mN4dK7nPyWYAZvg"
+        "kXUZlBmAD6MbzkCqjWS5AJ8FDFQNRFK8AlPLQJNoJMVV1HEBsX7Hpo5h6CVl2kUjufkBANT+"
+        "NpY7eZmmAAAAAElFTkSuQmCC"
+    ),
+    "town": (
+        "iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAAcUlEQVR42mOw6rf6TwlmQBc4"
+        "YaQBxmQZANOMyxBs4gy4NKMrxiXOgE8zIYww4MQJnBifPIoBAgICcInuKG0MA7DJ43QBNgOw"
+        "yWONRorTAalpAWdCItYQvAmJGEMIJiRChqC6AE98E20ArvgmywXEGAAALsZGMAq6xgAAAAAA"
+        "SUVORK5CYII="
+    ),
+    "castle": (
+        "iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAAhklEQVR42q2TwQnAIBAELcEy"
+        "8s7TSqxJAmnrXikijRgUlEXPWx95DKJ7NyqoC3fIFnIeHS13u4JVTgXeezOvgpRSxnEl0Oq6"
+        "oDEWFgHOsU4V7DIJ2k4MPNHyBCIygXmMkV+h7NQYMyrAZk3yv6AsIJpgrKEv8X2uDn2JVjOT"
+        "uJ1mS0I/E+MDyO4xkpN8un8AAAAASUVORK5CYII="
+    ),
+    "dungeon": (
+        "iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAAdUlEQVR42mOw6rf6TwlmwCYY"
+        "ERGBFRNlAEhhV1cXBsZlCAMxmvEZwoBLs4CAAArGZQhWA9A1YzMExQBiNCMbguwKFAMIaUY3"
+        "ZJAZAMLEGoARBjBDSDEAZ0IiRTPWpHxkXcb/R+d6sGKQHN6kjE8zLkMYKM3OAALZ6rpGmt2R"
+        "AAAAAElFTkSuQmCC"
+    ),
+    "lair": (
+        "iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAAhUlEQVR42mOw6rf6TwlmwCZo"
+        "p5SGFRNlAEhhnsMqDIzLEAZiNOMzhAGXZgEBARSMyxCsBsA0nTDSAGNshqAYgE0zLozuChQD"
+        "kG1G14juErwGEOsKggaghwFeA0CYWBdghAHMEFIMwJmQSNGMNSmnRFj990mxwYpBcniTMj7N"
+        "uAxhoDQ7AwDPUcl+d3iPIQAAAABJRU5ErkJggg=="
+    ),
+    "brick": (
+        "iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAAPUlEQVR42mNYEKT7HxeOiIj4"
+        "T0ieAcRIMZHCimEG4JOn3AAQQQlmINXP6GIMpDoZXZ5yA6gaBqPpYMSmAwBExe1IpnFwwQAA"
+        "AABJRU5ErkJggg=="
+    ),
+    "stone": (
+        "iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAALElEQVR42mM4ceLEf1y4q6vr"
+        "PyF5hlEDBoMBIIISzECqjehiowYMCgMoTQcAtuYrljOPBX8AAAAASUVORK5CYII="
+    ),
+    "cobble": (
+        "iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAAd0lEQVR42mN4dK7n/5F1GWAM"
+        "YsMwNj42MQZcGtHFsRmM0wBkjM0AZMyALkhIA7o8Az5/43M+9QxAdyK+wEOXh4cBIX/ji1IG"
+        "Yp2KS54BV8iTZAC6v4iNUpQwwOdXfIHLQEkUwg3AZwNBA7D5n5g0gDUlEuN3dHEAVv0aQmUC"
+        "PN4AAAAASUVORK5CYII="
+    ),
+    "wood": (
+        "iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAAQ0lEQVR42mPY0eDxnxLMQLEB"
+        "3VHa/ynBWF0QZSFFmRdIMoAmXsCH0V1HuQFU8wIpAYfVC2QbQJdYwOc6yg2ge0JCxwCILlV/"
+        "P/4DpAAAAABJRU5ErkJggg=="
+    ),
+    "counter": (
+        "iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAAP0lEQVR42mPY0eDxnxLMQLEB"
+        "URZS/ynBDMPAC91R2v8pwWADcJkOU4RPHm4AusnoBuCSH04GUBSIFEXjgOcFALjSD78RZL0C"
+        "AAAAAElFTkSuQmCC"
+    ),
+    "carpet": (
+        "iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAAP0lEQVR42mN4cdT9f5WMyP8T"
+        "RhokYZAekF4GmhqAz2CCBsDE8BmO0wBCfLwGEOsd2rmAKmFAlVgYyelg6MUCAGgBIv9gue95"
+        "AAAAAElFTkSuQmCC"
+    ),
+    "throne": (
+        "iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAAWklEQVR42mN4cdT9f5WMyP8T"
+        "RhpgvKJN/j9IDBsGycHUgfSAxBhwGQASQ8ZkGYCueAgaQHIYgBQQg/EakOewCi+mvQEUewE9"
+        "UHHFBO0MAGFcBhD0Ail48BgAAHwKPivFWlJnAAAAAElFTkSuQmCC"
+    ),
+    "fountain": (
+        "iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAAlElEQVR42mN4dK7n/5F1GWAM"
+        "YsMwNj42MQZ0wRMnTuDFeA0AKejq6sKLYYbAXMQA48A0a0Ttw4uRDQFhBnTbkRXnLf1AvgEg"
+        "zSCAbgiGATC/kOMCeBjg8gII4DIAFvjU8QIuF2DzDlEGYPM7Ni8QDAOS0gFyTBCTElEMQM4o"
+        "pOQFlDDAleOQxbHJMaALoGvAla1h4gCDGeDyfKZHcwAAAABJRU5ErkJggg=="
+    ),
+    "door": (
+        "iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAAVklEQVR42mNYEKT7H4QjIiL+"
+        "R1lIEYVBamH6GFJMpP6DMMyA7ihtOIZpQBcDqYXpo9wAEAeGSTEAhhnQw4BYA0ZqGLw46k5Z"
+        "GCAbMJoOaBkGxGZnGAYAPHrm2KLmMoQAAAAASUVORK5CYII="
+    ),
+    "sign_weapon": (
+        "iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAAkUlEQVR42mN4dK7n/5F1GWAM"
+        "YsMwNj42MQYQEWUhRRZGMWBHgwdJGG4AyCnEGHDixAkwRjYApJcoA9A1k2QANs0oBqCHwYo2"
+        "eYKaCYYByBB8mgl6AcRHdgleA9C9gMs7RBtAdjogB8PDAFvaR06u2ORhmAFXRkG2Ba8ByBLI"
+        "BiEbABPHZggDNlORcyiubA0TBwBLZ5ErrKcszAAAAABJRU5ErkJggg=="
+    ),
+    "sign_armor": (
+        "iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAAkklEQVR42mN4dK7n/5F1GWAM"
+        "YsMwNj42MQYQEWUhRRZGMWBHgwdJGG4AyCnoBpw4cQIrRjcApBenAVUyIiiYLANeHHUHY7wG"
+        "YAsDYg3AGQbo3kDXTNAL6IGJKxZweoHYaKTYAJQwIAfDwwBb2kdOrtjkYZgBV0ZBtgWvAcgS"
+        "yAYhGwATx2YIAzZTkXMormwNEwcAwASSI5rhaVcAAAAASUVORK5CYII="
+    ),
+    "sign_inn": (
+        "iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAAjElEQVR42mN4dK7n/5F1GWAM"
+        "YsMwNj42MQYQEWUhRRZGMWBHgwdJGG4AyCm4DHhx1B2McRkA0ovTAHyayTIABLAagCsMkA1A"
+        "BmSHAU4X4DMA2ZAVbfKkeYGYaKTYAJQwIAfDwwBb2kdOrtjkYZgBV0ZBtgWvAcgSyAYhGwAT"
+        "x2YIAzZTkXMormwNEwcAwJuX3RnsCikAAAAASUVORK5CYII="
+    ),
+    "sign_healer": (
+        "iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAAe0lEQVR42mN4dK7n/5F1GWAM"
+        "YsMwNj42MQYQEWUhRRZGMWBHgwdJGG4AyCm4DDhhpAHGuAwA6aWNATCN6BirAdjCgFgDBkkY"
+        "UBKNFBuAEgbkYHgYYEv7yMkVmzwMM+DKKMi24DUAWQLZIGQDYOLYDGHAZipyDsWVrWHiAPKe"
+        "g9fyrorrAAAAAElFTkSuQmCC"
+    ),
+    "sign_tavern": (
+        "iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAAi0lEQVR42mN4dK7n/5F1GWAM"
+        "YsMwNj42MQYQEWUhRRZGMWBHgwdJGG4AyCnoBmAD2AwA6cVqwIuj7hiYYgNWtMmDMYYB2MIA"
+        "lwvQDcAZBiS5gOIwwOYFmG3ImCQDyEoH5GB4GGBL+8jJFZs8DDPgyijItuA1AFkC2SBkA2Di"
+        "2AxhwGYqcg7Fla1h4gC9B5v2RflC6gAAAABJRU5ErkJggg=="
+    ),
+    "dwall": (
+        "iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAASUlEQVR42mOIiIj4jwtraaj9"
+        "7+rqwivPAGKAFKFjmAJC8tQxAJ8TCckzgAhKMAOpgYYuz0Cqn9HlKTeA1EBDF6NuII6mxAFK"
+        "iQA6twQrLoa26QAAAABJRU5ErkJggg=="
+    ),
+    "dfloor": (
+        "iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAAUklEQVR42mOwMtL5TwlmABF+"
+        "LlaUGUAM1tJQI98AXJqxGkCsd2DqGKgSiPicSHQg4jMEn7eo4wVSMbJryY4FolxATOAyUJKI"
+        "SA4DbN6jX2bChQHPPpecvd9QDwAAAABJRU5ErkJggg=="
+    ),
+    "stairs_down": (
+        "iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAAWUlEQVR42mOwMtL5TwlmABER"
+        "ERFkYRQDTpw4QRLGMKCrq4tojNUFWhpqJGGKvIDVBaQ4H6sL6OIFmNOxGkCK8+nvBWSn4zSA"
+        "WKfjNEBAQIAkjGEARZmJEgwA6KkRLXOXNV4AAAAASUVORK5CYII="
+    ),
+    "stairs_up": (
+        "iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAATUlEQVR42mOwMtL5TwlmIFZh"
+        "d5T2/ygLKTobANKEjMkyAKQJGZNlAEmBSIyzCRpAyNlEGUBSOiDV2VgNIMXZOA0gOylTbABd"
+        "MhPNDAAA5wSijGo1SroAAAAASUVORK5CYII="
+    ),
+    "chest": (
+        "iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAAVElEQVR42mOwMtL5TwlmGFwG"
+        "RFlIEYWxGgCS2NHgQRRGNoSBVM3ohsANWNEmTxLGMKA7ShsDwxRjkyNoAEijgIAAGGMzhPYu"
+        "IISpH4jk4EGYF8jBABY51UZJJjRkAAAAAElFTkSuQmCC"
+    ),
+    "avatar": (
+        "iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAAeklEQVR42mNgoBWIspD6j4wp"
+        "0kyyISDFHw5MQMHoBpw4cQK3gSANAgICcM0wNkkGYMNEGwAz5ISRBhija8ZrgEbUvv/4MF4D"
+        "CGmGYZCLVrTJ/8fqbGSFL466gzG6C7BqhhmAzyVEpwOKDaA4JaLbSLYXyDIAm5PxeQMA9LLq"
+        "W4MTnSAAAAAASUVORK5CYII="
+    ),
+    "lord": (
+        "iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAAeklEQVR42mNgQAMvjrr/R6Zx"
+        "ieEEIEX4MFEGVMmIYGiEiRE04MOBCf/xYaIMEBAQwNAIE6O9C/4jAZgmZMBADPiPAxDUeMJI"
+        "4z8yhgF0caI0E8JYA49YF2ANTGQDcAG8BqB7A5dmnGFAcSCSEpB4ozLKQuo/DOMTgwEAwEyG"
+        "hP93icsAAAAASUVORK5CYII="
+    ),
+    "guard": (
+        "iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAAhUlEQVR42mNgwAO6o7T/gzAD"
+        "OQCmmSRD0DXhwkQZ9uHAhP/ImGQvCAgIwDWD2CQbQLELkA3BJtfV1YXd0BNGGv/xYbwGoCt+"
+        "cdQdjLEZgtUAkHMJuQDmLZwG4PMGUWEAi0IQBjkfxkaPSrwGSBg0gDWDaGQ2fQ1A1oDOJ5iE"
+        "0f2MKxxAAACK6uMD7n5sWgAAAABJRU5ErkJggg=="
+    ),
+    "man": (
+        "iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAAYklEQVR42mNgoBWIspD6j4wp"
+        "0kyyISDFHw5MQMEkGQDSICAgANcMY5NkADZMUjiQrdmq3+o/PkyRZoKGgJxKSDNe78Ak8dlM"
+        "VHh0R2n/x4YpDkiSkzIuPm0NACVbGMYnBgMAFIPK5XIof40AAAAASUVORK5CYII="
+    ),
+    "woman": (
+        "iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAAaElEQVR42mNgoBV4cdT9PzKm"
+        "SDPJhoAUfzgwAQUTbQBMs4CAAFwzjE2UIdhsJ8kVMEXompHlCII8h1X/sWGKNBNlCMiphAyA"
+        "eQenAYS8gNcAir1ASDNBQygygFjNRHkFlHRBGBcfGQAAps8ixqgtv4QAAAAASUVORK5CYII="
+    ),
+    "merchant": (
+        "iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAAYklEQVR42mNgoBX4cGDCf2RM"
+        "kWaSDQEpFhAQgGuEsenrgigLKRRMcjigG0C0xh0NHv/xYaI04wIEDQH5kxDAGxYwSVyakdXg"
+        "BfgMIApQbEBERMR/EMbFp60BoHQPw/jEYAAAeSoY8nzjcSYAAAAASUVORK5CYII="
+    ),
+    "jester": (
+        "iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAAf0lEQVR42mNgQAIvjrr/ZyAA"
+        "8Ko5YaTxH4Rxyec5rPoPwnhtgBmCbBBMI0HN2AwBYZI0g8CHAxP+Y8MkGSAgIADXCGOTZAC6"
+        "N0gyAJs3iNaIKwBJjkJcBuA1BJvf0TXj9Q5MEpcByGrwAmRN2FIm0QYQm0eoawAou8IwPjEY"
+        "AAC0FO25nAkNUwAAAABJRU5ErkJggg=="
+    ),
+    "rat": (
+        "iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAAQklEQVR42mNgGAXDEZw4ceI/"
+        "CJOtuaurCyfGq1lAQACvZrwGEasRqyEveqb9p8gAclwAsxiEsXoHmcYlBjNk4NMNAEtbsYgw"
+        "C5tuAAAAAElFTkSuQmCC"
+    ),
+    "bat": (
+        "iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAATElEQVR42mNgGJ7ATintPzFi"
+        "cAl0SXQxvGpgDGwa0DE2eZyKTxhpYGVjGIpLgliM18kwQMhLeA0hSjNyNBGjEWeU4jKMKE3E"
+        "ppFhCACNdK8HWVedYwAAAABJRU5ErkJggg=="
+    ),
+    "snake": (
+        "iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAAWUlEQVR42mNgGAVEAat+q//I"
+        "mCLNJBsCUiwgIADXCGPTzwW4wuCEkcZ/ogMKmziKASAJlRQNFIysGK/TYZqx+RObOF4DCBmO"
+        "N5AIuYKokEYPB6I144tzQnoARTmiZB59yIoAAAAASUVORK5CYII="
+    ),
+    "slime": (
+        "iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAAUUlEQVR42mNgGAW0BXn7Av6D"
+        "MEWaSTYEXSNJBoEUwADJBsE0E9KI0xCYoICAABijK8YmjtXfpBgAN4QUZ2M1wKrfimSNID0o"
+        "YQASIAVTLbUCACrp/O+WzPteAAAAAElFTkSuQmCC"
+    ),
+    "wolf": (
+        "iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAARUlEQVR42mNgGAVw0NXV9R+Z"
+        "JssAGCZbs4CAwH+SDULWQCzGMOTEiRP/KTaIHM0UGYI3PNDZhOSoZwAoGkEYnU1IbmABAMbv"
+        "1JvZPqVkAAAAAElFTkSuQmCC"
+    ),
+    "goblin": (
+        "iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAAa0lEQVR42mNgGD4gb1/Af4rU"
+        "ggRhGJ2PTQyv6fgwUc47YaSBoREmRpQBFLkAZoiAgAAKJiWQGXAFIjI4ceIEdgOjLKT+48N4"
+        "DQDZRMgAmGtwGoDPFejew+l/dA3ofKIDkGgbkQFy1OETgwEAYnm/B+vebFwAAAAASUVORK5C"
+        "YII="
+    ),
+    "orc": (
+        "iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAAfUlEQVR42mNgwAJUUjT+Y8MM"
+        "xABcmok2BKTohBGmRpgYfVwAAugaYWIUhQNeTV1dXf8jIiKIwiC1GDYSqxmGUVwEcyIpmrEa"
+        "AGIT0oysHu4VZAOiLKT+48NYDUAGxBgAAt1R2oQNwCcGMoBgGsAnRrEBWIGAgMB/ZExIHAQA"
+        "rCMN6MKeDF8AAAAASUVORK5CYII="
+    ),
+    "skeleton": (
+        "iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAAUklEQVR42mNgwAFOnDjxHxkz"
+        "kALQNZNsiICAwH8QhmmE8ennApghyC5hIAdQNQCJMgxZAS6NeA2BSeKznSgDyHYB1VMi2bGB"
+        "TfEQMgCXf3GJAwBNn+o3J9BwegAAAABJRU5ErkJggg=="
+    ),
+    "spider": (
+        "iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAAW0lEQVR42mNgGB5AQEDgPzY2"
+        "SeoIGUKUJeiKkDExLsSqEZdBBDWdMNLAysYwDN1UUlyANSCRcZWMCBgT7Q10g9ANICkKsdmK"
+        "0xBsCpANwWYZ1kAkGMdkqKc9AABt0mTbe2zZVAAAAABJRU5ErkJggg=="
+    ),
+    "troll": (
+        "iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAAbElEQVR42mNgQAMNPR7/sWEG"
+        "YgAuzdgM6Y7S/o/VgBNGGhgakcWQDcAwhFgXwDTjNAAdEGU7sYEIYpPsdLwBSpFmZAOINQyn"
+        "n0HsKAup/4Qw9Q1ABtgUk2QANv+SlCdwKaSPAQICAv+RMbFyACJPRl71VwGYAAAAAElFTkSu"
+        "QmCC"
+    ),
+    "ghost": (
+        "iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAAPklEQVR42mNgoAU4ceLEf2yY"
+        "Is1EGUJIM0FDYAoEBATAGBef9gZQ7AVcNtPfAIq9MIQNQDcMGx+nAaTwqQIA3KCHq5IZW3IA"
+        "AAAASUVORK5CYII="
+    ),
+    "daemon": (
+        "iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAAgUlEQVR42mNggIITJ078ZyAS"
+        "YFWLLnjCSOM/MiZoALIEumZkQwi6FKb4xVH3/1UyImAMYoMwNtfgNQSfN+AAZgu6AegA3QC4"
+        "PhgDZggu25FdgaIHmUNIMwxT1wD0cCDFCyTFANFRiGwILj5VDMBrICED8GoWEBD4D8PYxEjy"
+        "CjEAAPsVDuprdEHiAAAAAElFTkSuQmCC"
+    ),
+    "dragon": (
+        "iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAAc0lEQVR42mNgIBJUyYj8B2EG"
+        "cgBMM1mGwDS9OOoON+BZhdx/sm2HGYBiCC5nYdMMk8MwAN0QkvyNrvCEkcZ/EMbnArxOhRmA"
+        "yyC8hqBrJtkQXAagG4I3PCgyAFug4hMjKd0ji+PULCAg8B+GcYmTnaloAgD3zb1pGFSSegAA"
+        "AABJRU5ErkJggg=="
+    ),
+    "serpent": (
+        "iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAARklEQVR42mNgGDLAqt/qPwxT"
+        "pJksg0CKBQQE/pPtCrJtxuX3E0Ya/6kfcNgUE20ATJFKigaKBmQxgpqJMRCnAVRPOCMMAADu"
+        "X2K4WUTN6wAAAABJRU5ErkJggg=="
+    ),
+    "moosedain": (
+        "iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAAeUlEQVR42mPojtL+D8IMUIDO"
+        "xyWOwodxcGlG14RVHSFDiLUErjDKQgoFE9SIDtANYCAFgDScMNKAa4axybadbFfg0vziqPt/"
+        "ogwQEBAAY3QDVrTJ4zYgz2HVf3wYFlNkaYZhnAaAnEqRC2B+xacZrwEDHwbEGoCsBwCCFgmv"
+        "gEidFwAAAABJRU5ErkJggg=="
+    ),
+    "hit": (
+        "iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAAPElEQVR42mNgoCV4cdT9P0Ua"
+        "CPEJGoKLTbQh/4GALK/ANMMAUTYiY2wAXQ11XUDVMKAoFqiSDijSMEIBAABpgHsoZ0M9AAAA"
+        "AElFTkSuQmCC"
+    ),
+    "bolt": (
+        "iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAAOUlEQVR42mNgGJ7gWYXcf2RM"
+        "luYXR93BmCSDkDXDALpBBA1A1oxsCNEuoNgAirxAcSBSJRpHAekAAKsNo4WhEiSoAAAAAElF"
+        "TkSuQmCC"
+    ),
+}
+# ── TILE DATA END
+
+
+def main():
+    if icon_args(sys.argv[1:]):
+        return
+    root = tk.Tk()
+    set_window_icon(root)
+    Game(root)
+    root.mainloop()
+
+
+if __name__ == "__main__":
+    main()

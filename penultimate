@@ -12,6 +12,10 @@ Every new game generates a new world (map, towns, people, dungeons, quests);
 within a game the world is fixed.  The game is saved to ~/.penultimate.json
 whenever you change location and when you quit, and resumed next time.
 
+Beware the wood witches of the deep forests: their curse turns you into a
+beaver, with few hit points, only a bite to fight with, and no one able to
+understand you.  Only Lord Canadian can turn you back.
+
 Talking: walk into a person (or into a shop counter with someone behind it),
 then type a word and press Return.  Everyone knows NAME, JOB and BYE; most
 people know NEWS, and words in CAPITALS are worth asking about.  Shopkeepers
@@ -77,7 +81,7 @@ DUNGEON_FLOOR = {"dfloor", "stairs_up", "stairs_down"}
 SPRITES = {"avatar", "lord", "guard", "man", "woman", "merchant", "jester",
            "rat", "bat", "snake", "slime", "wolf", "goblin", "orc",
            "skeleton", "spider", "troll", "ghost", "daemon", "dragon",
-           "serpent", "moosedain", "hit", "bolt"}
+           "serpent", "moosedain", "witch", "beaver", "hit", "bolt"}
 SITE_COLORS = {"town": "#ff5040", "castle": "#ffffff", "dungeon": "#ffa020",
                "lair": "#d040ff"}
 DIRS = ((0, -1), (0, 1), (-1, 0), (1, 0))
@@ -136,6 +140,8 @@ MONSTERS = {
                       "ranged"),
     "dragon": Monster("dragon", "dragon", 6, 80, (7, 18), 6, 180, "both",
                       "ranged"),
+    "witch": Monster("wood witch", "witch", 3, 18, (2, 6), 2, 35, "forest",
+                     "curse"),
     "moosedain": Monster("Moosedain", "moosedain", 8, 180, (8, 20), 7, 1000,
                          "none", "ranged"),
 }
@@ -152,8 +158,10 @@ BOSS_NAMES = ["Grubnak", "Skarr", "Vorgath", "Ulmog", "Krell", "Mortis",
 START_PLAYER = {"name": "Avatar", "level": 1, "hp": 30, "maxhp": 30,
                 "str": 10, "dex": 10, "xp": 0, "gold": 60, "food": 250,
                 "potions": 2, "weapon": "Dagger", "armor": "Clothes",
-                "poison": False}
+                "poison": False, "beaver": False}
 MAX_LEVEL = 10
+BEAVER_HP = 12                  # a beaver's most hit points
+BEAVER_BITE = (1, 3)            # and its damage
 
 
 def xp_needed(level):
@@ -230,6 +238,19 @@ TIPS = [
     "Drink a healing potion when thou art hurt: press P.",
     "Lord Canadian raises thy level when thou hast gained the experience.",
     "Treasure chests lie deep in the dungeons.",
+    "Beware the wood witches of the deep forests: they turn travellers "
+    "into beavers! Only Lord Canadian can undo their magic.",
+]
+# What people say to a hero who has been turned into a beaver; %s: realm
+BEAVER_LINES = [
+    "What a cute beaver!",
+    "Aww, look at its little teeth!",
+    "Shoo! Don't thou chew on my porch!",
+    "Here, beaver beaver beaver...",
+    "That beaver is staring at me like it wants to say something.",
+    "A beaver, in town? That's very %s of it.",
+    "Someone should take that beaver to Lord Canadian. He loves animals.",
+    "Oh! Does it want a stick? I think it wants a stick.",
 ]
 JOKES = ["Why did the moose cross the road? To apologise to the other side!",
          "What is a moose's favourite music? Moose-ic! ...Moosedain never "
@@ -1567,6 +1588,13 @@ class Game:
         self.log.config(state="disabled")
         self.log.see("end")
 
+    def max_hp(self):
+        return min(BEAVER_HP, self.p["maxhp"]) if self.p["beaver"] \
+            else self.p["maxhp"]
+
+    def armour_ac(self):
+        return 0 if self.p["beaver"] else ARMOURS[self.p["armor"]].ac
+
     @staticmethod
     def the(mob):
         return mob.name if mob.boss else "the " + mob.name
@@ -1682,7 +1710,7 @@ class Game:
             if random.random() < 0.05:
                 p["poison"] = False
                 self.say("The poison has worn off.", "good")
-        elif p["food"] > 0 and self.turn % 6 == 0 and p["hp"] < p["maxhp"]:
+        elif p["food"] > 0 and self.turn % 6 == 0 and p["hp"] < self.max_hp():
             p["hp"] += 1
         if p["hp"] <= 0:
             self.die()
@@ -1723,6 +1751,11 @@ class Game:
         dist = abs(dx) + abs(dy)
         if dist == 1:
             self.monster_attack(mob)
+            return
+        if ("curse" in mob.traits and not self.p["beaver"] and dist <= 5
+                and self.line_clear(self.area, mob.x, mob.y, px, py)
+                and random.random() < 0.3):
+            self.witch_curse(mob)
             return
         if ("ranged" in mob.traits and (dx == 0 or dy == 0) and dist <= 6
                 and self.line_clear(self.area, mob.x, mob.y, px, py)
@@ -1768,11 +1801,13 @@ class Game:
             if not a.inside(x, y) or a.mob_at(x, y):
                 continue
             t = a.grid[y][x]
+            cx, cy = self.world["castle"]
+            danger = min(6, 1 + int(math.hypot(x - cx, y - cy) // 8))
             if t == "deep" and random.random() < 0.3:
                 kind = "serpent"
+            elif t == "forest" and danger >= 2 and random.random() < 0.25:
+                kind = "witch"
             elif t in LAND:
-                cx, cy = self.world["castle"]
-                danger = min(6, 1 + int(math.hypot(x - cx, y - cy) // 8))
                 kind = random.choice([
                     k for k, m in MONSTERS.items()
                     if m.habitat in ("world", "both")
@@ -1802,16 +1837,21 @@ class Game:
             self.sound.play("miss")
             return
         self.flash(mob.x, mob.y)
-        if mob.kind == "moosedain" and p["weapon"] != "Maple Blade":
+        if mob.kind == "moosedain" and (p["weapon"] != "Maple Blade"
+                                        or p["beaver"]):
             self.say("Your blow glances off Moosedain's enchanted hide! "
                      "Only the Maple Blade can harm him.", "bad")
             self.sound.play("miss")
             return
-        dmg = max(1, random.randint(*WEAPONS[p["weapon"]].dmg) +
-                  (p["str"] - 10) // 3)
+        if p["beaver"]:
+            dmg = random.randint(*BEAVER_BITE)
+        else:
+            dmg = max(1, random.randint(*WEAPONS[p["weapon"]].dmg) +
+                      (p["str"] - 10) // 3)
         mob.hp -= dmg
         if mob.hp > 0:
-            self.say("You hit %s. (%d)" % (self.the(mob), dmg))
+            self.say("You %s %s. (%d)" % ("bite" if p["beaver"] else "hit",
+                                          self.the(mob), dmg))
             self.sound.play("hit")
             return
         self.area.mobs.remove(mob)
@@ -1841,7 +1881,7 @@ class Game:
 
     def monster_attack(self, mob):
         p = self.p
-        ac = ARMOURS[p["armor"]].ac
+        ac = self.armour_ac()
         if random.randint(1, 20) + mob.level + 2 < 10 + ac + p["dex"] // 5:
             self.say("%s misses you." % cap(self.the(mob)), "info")
             return
@@ -1857,7 +1897,7 @@ class Game:
 
     def monster_ranged(self, mob):
         p = self.p
-        ac = ARMOURS[p["armor"]].ac
+        ac = self.armour_ac()
         verb = ("hurls a bolt of dark magic" if mob.kind == "moosedain" else
                 "breathes fire" if mob.kind == "dragon" else "hurls fire")
         self.sound.play("fire")
@@ -1870,6 +1910,23 @@ class Game:
         self.say("%s %s! (%d)" % (cap(self.the(mob)), verb, dmg), "bad")
         self.flash(*self.pos, tile="bolt")
 
+    def witch_curse(self, mob):
+        p = self.p
+        self.sound.play("fire")
+        self.flash(*self.pos, tile="bolt")
+        if random.randint(1, 20) + mob.level < 10 + p["dex"] // 4:
+            self.say("%s points her gnarled staff at you and cackles, but "
+                     "you shake off the spell." % cap(self.the(mob)), "info")
+            return
+        p["beaver"] = True
+        p["hp"] = min(p["hp"], BEAVER_HP)
+        self.say("%s points her gnarled staff at you and cackles... You "
+                 "have been turned into a BEAVER!" % cap(self.the(mob)),
+                 "bad")
+        self.say("You can only bite, you have little strength, and no one "
+                 "understands you. Only Lord Canadian can undo such "
+                 "magic.", "info")
+
     def die(self):
         self.busy = True
         self.render()
@@ -1881,6 +1938,7 @@ class Game:
         p = self.p
         p["hp"] = p["maxhp"]
         p["poison"] = False
+        p["beaver"] = False         # Lord Canadian sees to that, too
         p["gold"] = 0
         p["food"] = max(p["food"], 100)
         self.cache = {k: v for k, v in self.cache.items()
@@ -1921,7 +1979,7 @@ class Game:
             self.say("You have no potions!", "info")
             return
         p["potions"] -= 1
-        heal = min(p["maxhp"] - p["hp"], 15 + 5 * p["level"])
+        heal = min(self.max_hp() - p["hp"], 15 + 5 * p["level"])
         p["hp"] += heal
         p["poison"] = False
         self.say("You drink a healing potion. (+%d)" % heal, "good")
@@ -1942,6 +2000,9 @@ class Game:
         self.prompt.config(text="Your interest:")
         self.entry.delete(0, "end")
         self.entry.focus_set()
+        if self.p["beaver"] and not mob.lord:
+            self.beaver_talk(mob)
+            return
         if mob.lord:
             self.lord_greet(mob)
             if self.overlay == "won":
@@ -1954,6 +2015,23 @@ class Game:
             self.say("(Type a word such as NAME, JOB or NEWS and press "
                      "Return. BYE, or an empty line, ends the "
                      "conversation.)", "info")
+
+    def beaver_talk(self, mob):
+        """Nobody understands a beaver; there is no conversation."""
+        self.talk = None
+        self.talkbar.pack_forget()
+        self.say("You squeak and chitter at %s." % mob.title, "info")
+        if mob.shop:
+            line = "No beavers in the shop, please! Sorry, little fellow."
+        elif mob.tile == "guard":
+            line = "Move along, little beaver. Unless... art thou trying " \
+                   "to tell me something? Lord Canadian would know."
+        else:
+            line = random.choice(BEAVER_LINES)
+            if "%s" in line:
+                line = line % self.world["realm"]
+        self.npc_say(mob, line)
+        self.render()
 
     def end_talk(self):
         self.talk = None
@@ -2106,7 +2184,19 @@ class Game:
 
     def lord_greet(self, mob):
         p = self.p
-        self.say("You kneel before Lord Canadian.", "info")
+        if p["beaver"]:
+            self.say("You waddle up to the throne.", "info")
+            self.npc_say(mob, "Goodness, a beaver! Wait... those eyes... "
+                         "%s, is that thee? One of Moosedain's wood "
+                         "witches, I'll wager. Hold still, sorry, this "
+                         "might tickle." % p["name"])
+            p["beaver"] = False
+            self.say("Lord Canadian waves his sceptre. You grow taller, "
+                     "your tail shrinks away, and wood looks much less "
+                     "tasty. You are yourself again!", "quest")
+            self.sound.play("level")
+        else:
+            self.say("You kneel before Lord Canadian.", "info")
         for di in list(self.held):
             d = self.world["dungeons"][di]
             self.held.remove(di)
@@ -2194,6 +2284,10 @@ class Game:
                         % spot)
             return "Moosedain's lair lies %s. Only the Maple Blade can " \
                    "harm him. Go!" % spot
+        if k in ("witc", "beav", "curs"):
+            return "The wood witches lurk in the deep forests and turn " \
+                   "travellers into beavers. Come to me if it happens to " \
+                   "thee, and I shall set thee right."
         if k in ("moos", "evil", "enem"):
             return "Moosedain the Wicked, a sorcerer with the head of a " \
                    "moose and the manners of a goose. He sends his minions " \
@@ -2308,7 +2402,7 @@ class Game:
                 elif a.edge:
                     base = a.edge
                 if x == px and y == py:
-                    top = "avatar"
+                    top = "beaver" if self.p["beaver"] else "avatar"
                 idx = j * cols + i
                 old = self.shown[idx]
                 if old == (base, top):
@@ -2410,17 +2504,19 @@ class Game:
                 else "max")
         lines = [p["name"], "",
                  "Level   %d" % p["level"],
-                 "HP      %d/%d" % (max(0, p["hp"]), p["maxhp"]),
+                 "HP      %d/%d" % (max(0, p["hp"]), self.max_hp()),
                  "Str     %d" % p["str"],
                  "Dex     %d" % p["dex"],
                  "XP      %d/%s" % (p["xp"], need),
                  "Gold    %d" % p["gold"],
                  "Food    %d" % p["food"],
                  "Potions %d" % p["potions"], "",
-                 "Weapon", "  %s (%d-%d)" % ((p["weapon"],) +
-                                              WEAPONS[p["weapon"]].dmg),
-                 "Armour", "  %s (AC %d)" % (p["armor"],
-                                             ARMOURS[p["armor"]].ac), "",
+                 "Weapon", "  %s (%d-%d)" % (
+                     ("Teeth",) + BEAVER_BITE if p["beaver"] else
+                     (p["weapon"],) + WEAPONS[p["weapon"]].dmg),
+                 "Armour", "  %s (AC %d)" % (
+                     "Fur" if p["beaver"] else p["armor"], self.armour_ac()),
+                 "",
                  "Relics  %d/4" % len(self.returned)]
         for di in self.world["quests"]:
             d = self.world["dungeons"][di]
@@ -2433,11 +2529,13 @@ class Game:
             lines += ["", "Slay Moosedain!"]
         self.panel.config(text="\n".join(lines))
         cond = []
+        if p["beaver"]:
+            cond.append("BEAVER")
         if p["poison"]:
             cond.append("POISONED")
         if p["food"] <= 0:
             cond.append("STARVING")
-        if 0 < p["hp"] <= p["maxhp"] // 4:
+        if 0 < p["hp"] <= self.max_hp() // 4:
             cond.append("BADLY HURT")
         self.condition.config(text="\n".join(cond))
         self.btn["mute"].config(
@@ -2984,6 +3082,17 @@ TILE_PNG = {
         "iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAARklEQVR42mNgGDLAqt/qPwxT"
         "pJksg0CKBQQE/pPtCrJtxuX3E0Ya/6kfcNgUE20ATJFKigaKBmQxgpqJMRCnAVRPOCMMAADu"
         "X2K4WUTN6wAAAABJRU5ErkJggg=="
+    ),
+    "witch": (
+        "iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAAb0lEQVR42mNgwAPslNL+M5AL"
+        "QJphmCLNJBmCTSNZBuXtC/iPjpHlrfqt8BskICAA14jMRjYAryGEXNAdpf2fJG+gy+E1QCVF"
+        "4z8uTNAAfJqRMU4DQM6lyAV08QLtDCA2APEGIghEWUj9B2FCYjAAADdx0xwypgfXAAAAAElF"
+        "TkSuQmCC"
+    ),
+    "beaver": (
+        "iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAASklEQVR42mNgGAW0Ad1R2v+R"
+        "MUWaSTIEpFBAQOA/WYZEWUjh1EiUIf+hgCJDiNFMFUNA3oVhkg1A1ozXAHQ2LKDxakZWhM6m"
+        "GQAAMVGtxTkSWtMAAAAASUVORK5CYII="
     ),
     "moosedain": (
         "iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAAeUlEQVR42mPojtL+D8IMUIDO"

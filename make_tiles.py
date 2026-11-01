@@ -1388,6 +1388,25 @@ tile("frost", """
 ................
 """)
 
+tile("donut", """
+................
+................
+.....oooooo.....
+...oopppppWoo...
+..opprppeppppo..
+.oppppcpppprppo.
+.opeppoooopppco.
+opppco....opppro
+opprpo....oepppo
+.oppppoooopppeo.
+.oprppppcpppppo.
+..oppeppprpppo..
+...oopppppppoo..
+.....oooooo.....
+................
+................
+""")
+
 tile("hit", """
 ................
 .......e........
@@ -1438,6 +1457,7 @@ for theme, recolour in THEMES.items():
 # creatures bob up and down a pixel.
 for name in ("water", "deep"):
     TILES[name + "@1"] = [row[-4:] + row[:-4] for row in TILES[name]]
+TILES["zap"] = [row.replace("c", "p") for row in TILES["frost"]]   # sprinkles
 for name, (a, b) in (("fountain", "cW"), ("lava", "te"), ("torch", "et")):
     TILES[name + "@1"] = ["".join(b if ch == a else a if ch == b else ch
                                   for ch in row) for row in TILES[name]]

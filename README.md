@@ -72,8 +72,10 @@ quick and start with a hockey puck sling and leather armour.
 **Shops.** Every town has a blacksmith, armourer, healer, inn, tavern,
 outfitter and mage. Outfitters sell canoes, puck slings, pucks and
 rations; mages sell spellbooks: Heal, Cure, Light, Frost Bolt, Sorry (an
-apology so heartfelt that monsters run away) and Portage (back to the
-castle).
+apology so heartfelt that monsters run away), Portage (back to the
+castle) and, in every mage's shop, Donutify, which turns a lesser monster
+(or, regrettably, a villager) into a giant donut. Walk over a donut to eat
+it for 50 food.
 
 **Canoes.** Carry a canoe and you can paddle onto any lake or sea (sea
 serpents permitting). Islands off the coast hold inukshuks with gifts

@@ -26,7 +26,9 @@ is lost.
 A new game starts with character creation: choose a name and a class.
 Fighters are tough, mages start with spells and the most magic, and rangers
 start with a hockey puck sling.  Outfitters sell canoes (carry one and you
-can paddle onto any water), slings and pucks; mages sell spellbooks.  Days
+can paddle onto any water), slings and pucks; mages sell spellbooks,
+always including Donutify, which turns a lesser monster (or a villager)
+into a giant donut worth 50 food to whoever walks over it.  Days
 pass as you play: at night you see less, more monsters prowl, and only inns
 and taverns stay open.  Islands off the coast hold inukshuks with gifts
 beneath them.  Dungeons come in kinds: torchlit stone halls, ice caves with slick ice
@@ -102,7 +104,8 @@ SPRITES = {"avatar", "lord", "guard", "man", "woman", "merchant", "jester",
            "rat", "bat", "snake", "slime", "wolf", "goblin", "orc",
            "skeleton", "spider", "troll", "ghost", "daemon", "dragon",
            "serpent", "moosedain", "witch", "beaver", "wizard", "canoe",
-           "goose", "hit", "bolt", "puck", "frost", "key", "trap"}
+           "goose", "hit", "bolt", "puck", "frost", "key", "trap", "donut",
+           "zap"}
 SITE_COLORS = {"town": "#ff5040", "castle": "#ffffff", "dungeon": "#ffa020",
                "lair": "#d040ff"}
 DIRS = ((0, -1), (0, 1), (-1, 0), (1, 0))
@@ -212,7 +215,12 @@ SPELLS = {
     "Sorry": Spell(4, 100, False, "an apology so heartfelt that nearby "
                    "monsters flee"),
     "Portage": Spell(12, 300, False, "carries thee home to Castle Canadian"),
+    "Donutify": Spell(5, 150, True, "turns a lesser creature into a giant "
+                      "donut"),
 }
+SHOP_SPELLS = ["Heal", "Cure", "Light", "Frost Bolt", "Sorry", "Portage"]
+DONUT_TIER = 3                  # the mightiest monsters Donutify can change
+DONUT_FOOD = 50
 PUCK_DMG = (2, 6)
 PUCK_RANGE = 6
 BOLT_RANGE = 7
@@ -980,7 +988,7 @@ def shopkeeper(rng, world, kind, x, y, here):
     elif kind == "mage":
         shop["title"] = "the %s Tower" % rng.choice((
             "Aurora", "Northern Lights", "Starry", "Frostfire", "Moonlit"))
-        shop["stock"] = sorted(rng.sample(list(SPELLS), 4),
+        shop["stock"] = sorted(rng.sample(SHOP_SPELLS, 4) + ["Donutify"],
                                key=lambda n: SPELLS[n].price)
         job = "I study the arcane arts, and sell spellbooks to those with " \
               "the wit to read them."
@@ -2208,6 +2216,8 @@ class Game:
         if t == "slick":
             x, y = self.slide(dx, dy)
             t = a.grid[y][x]
+        if a.items.get((x, y)) == "donut":
+            self.eat_donut(x, y)
         if t == "stairs_down":
             self.change_level(1)
             return
@@ -2498,7 +2508,7 @@ class Game:
             return
         self.kill(mob)
 
-    def kill(self, mob):
+    def kill(self, mob, verb="kill"):
         p = self.p
         self.area.mobs.remove(mob)
         gold = random.randint(0, mob.xp // 2 + 1)
@@ -2506,8 +2516,8 @@ class Game:
             gold += 50 * mob.level
         p["xp"] += mob.xp
         p["gold"] += gold
-        self.say("You kill %s! (%d xp%s)" % (
-            self.the(mob), mob.xp, ", %d gold" % gold if gold else ""),
+        self.say("You %s %s! (%d xp%s)" % (
+            verb, self.the(mob), mob.xp, ", %d gold" % gold if gold else ""),
             "good")
         self.sound.play("kill")
         for q in self.world["side"]:
@@ -2739,7 +2749,11 @@ class Game:
     def fire(self, dx, dy):
         p, a = self.p, self.area
         aim, self.aim = self.aim, None
-        if "spell" in aim:
+        if aim.get("spell") == "Donutify":
+            p["mp"] -= SPELLS["Donutify"].mp
+            self.sound.play("spell")
+            tile, reach, dmg, skill = "zap", BOLT_RANGE, 0, 0
+        elif "spell" in aim:
             p["mp"] -= SPELLS[aim["spell"]].mp
             self.sound.play("spell")
             tile, reach = "frost", BOLT_RANGE
@@ -2784,6 +2798,10 @@ class Game:
 
     def missile_hit(self, mob, tile, dmg, skill):
         self.busy = False
+        if tile == "zap":
+            self.donutify(mob)
+            self.end_turn()
+            return
         what = "puck" if tile == "puck" else "bolt of frost"
         if mob is None:
             self.say("The %s %s." % (what, "clatters away" if tile == "puck"
@@ -2809,6 +2827,44 @@ class Game:
             else:
                 self.kill(mob)
         self.end_turn()
+
+    def donutify(self, mob):
+        a = self.area
+        if mob is None:
+            self.say("A shower of sprinkles patters harmlessly to the "
+                     "ground.", "info")
+            return
+        if mob.lord:
+            self.npc_say(mob, "Ha! Nice try, eh. Sprinkles in my beard "
+                         "again...")
+            return
+        if mob.goose is not None:
+            self.say("The spell bounces off %s. Geese are immune to "
+                     "everything." % mob.name, "info")
+            return
+        if mob.hostile and (mob.boss or mob.level > DONUT_TIER):
+            self.flash(mob.x, mob.y, "zap")
+            self.say("%s is too mighty to be donutified, and shakes off "
+                     "the sprinkles." % cap(self.the(mob)), "bad")
+            return
+        x, y = mob.x, mob.y
+        if mob.hostile:
+            self.kill(mob, "donutify")
+        else:
+            a.mobs.remove(mob)
+            self.say("Poof! %s turns into a giant donut. Somewhere, a "
+                     "Mountie frowns." % (mob.name if mob.known else
+                                          cap(mob.title)), "bad")
+            self.sound.play("kill")
+        a.items[(x, y)] = "donut"
+        self.flash(x, y, "zap")
+
+    def eat_donut(self, x, y):
+        del self.area.items[(x, y)]
+        self.p["food"] += DONUT_FOOD
+        self.say("You eat the giant donut. Delicious! (+%d food)"
+                 % DONUT_FOOD, "good")
+        self.sound.play("potion")
 
     def visit_inukshuk(self, x, y):
         key = "inuk:%d,%d" % (x, y)
@@ -4314,6 +4370,12 @@ TILE_PNG = {
         "LM0wQJJB6JqRAVGG4NIMM4AoF1BsAEVeoDgQqRKNo4B0AAAg/cHVG9LgCwAAAABJRU5ErkJg"
         "gg=="
     ),
+    "donut": (
+        "iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAAdklEQVR42mNgGJRgR4PHf2yY"
+        "aI0veqZhYBDAaxCyxhNGGgjNR90xDMMwBJuteUs/YIghG4xiCNwAJNvQ/Y9uONwAvJJ4XAly"
+        "DVgdNr/jNAAtPHC6gpAXQAZhDQOU0McTmIRjAs2p6AbjTQu4EhK612iTlAcEAABD6YD6JIbw"
+        "DwAAAABJRU5ErkJggg=="
+    ),
     "hit": (
         "iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAAPElEQVR42mNgoCV4cdT9P0Ua"
         "CPEJGoKLTbQh/4GALK/ANMMAUTYiY2wAXQ11XUDVMKAoFqiSDijSMEIBAABpgHsoZ0M9AAAA"
@@ -4433,6 +4495,11 @@ TILE_PNG = {
         "iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAASUlEQVR42mOQMGj4TwlmoKkB"
         "GlH74JhkA9A14TKEci8QciIhLzIQciIhLzIM7mgkJjoZiPUrLv4gCgNkf5ISpQy40gCxhlDs"
         "BQAI3NDoDoE82wAAAABJRU5ErkJggg=="
+    ),
+    "zap": (
+        "iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAANElEQVR42mNgGJ7gRc+0/8iY"
+        "LM0wQJJB6JqRAVGG4NIMM4AoF1BsAEVeoDgQqRKNo4B0AAAcUsKnOe88lgAAAABJRU5ErkJg"
+        "gg=="
     ),
     "fountain@1": (
         "iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAAlUlEQVR42mN4dK7n/5F1GWAM"

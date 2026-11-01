@@ -39,6 +39,16 @@ elsewhere on the level.  Townsfolk who need HELP offer errands: slaying monsters
 fetching stolen things from dungeons, catching runaway geese and carrying
 parcels to other towns.
 
+Touch and mouse: tap a square to walk there (next to you: step, fight or
+talk; on yourself: wait), tap to aim, and tap choices in menus.  Talking
+offers its topics as a menu, so no keyboard is needed: this is how to play
+in Pydroid 3 on Android.  The buttons below the map do the rest.
+
+Gamepad (Linux, including the Steam Deck): the joystick device is read
+directly.  D-pad or left stick move, A waits or chooses, B backs out, X
+fires the sling, Y casts, LB drinks a potion, RB shows the journal, View
+the map and Start the menu.  PAD_BUTTONS below maps other pads.
+
 Keys:  arrows / WASD   move (into monsters to fight, into people to talk)
        F + direction   fire a hockey puck   C + number   cast a spell
        space           wait a turn        P   drink a healing potion
@@ -63,11 +73,14 @@ source is make_tiles.py, which regenerates that block.
 import array
 import atexit
 import base64
+import glob
 import json
 import math
 import os
 import plistlib
+import queue
 import random
+import re
 import shutil
 import struct
 import subprocess
@@ -79,9 +92,11 @@ import tkinter as tk
 import wave
 import zlib
 from collections import namedtuple, deque
+from tkinter import font as tkfont
 from tkinter import messagebox
 
 SAVE_FILE = os.path.expanduser("~/.penultimate.json")
+ANDROID = hasattr(sys, "getandroidapilevel") or "ANDROID_ROOT" in os.environ
 
 # ── Terrain ──────────────────────────────────────────────────────────────────
 #
@@ -109,6 +124,7 @@ SPRITES = {"avatar", "lord", "guard", "man", "woman", "merchant", "jester",
 SITE_COLORS = {"town": "#ff5040", "castle": "#ffffff", "dungeon": "#ffa020",
                "lair": "#d040ff"}
 DIRS = ((0, -1), (0, 1), (-1, 0), (1, 0))
+MAX_ZOOM = 6
 LIGHT_RADIUS = 6
 DAY = 240                       # turns in a day: 10 per hour
 
@@ -1601,6 +1617,47 @@ class Sound:
             pass
 
 
+# ── Gamepad ──────────────────────────────────────────────────────────────────
+#
+# Tk knows nothing of gamepads, but on Linux (a Steam Deck included) the
+# kernel's joystick devices can be read directly: 8-byte events of time,
+# value, type (1 button, 2 axis) and number.  A thread reads them and hands
+# them to the Tk loop through a queue.  The numbers below are those of the
+# xpad driver (Xbox-style pads and Steam's virtual gamepad); edit them for
+# other pads.
+
+PAD_BUTTONS = {0: "a", 1: "b", 2: "x", 3: "y", 4: "lb", 5: "rb",
+               6: "view", 7: "start",
+               11: "left", 12: "right", 13: "up", 14: "down"}  # d-pad buttons
+PAD_STICK = (0, 1)              # left stick x, y axes
+PAD_HAT = (6, 7)                # d-pad x, y axes
+PAD_DEADZONE = 16000
+
+
+class Gamepad:
+    def __init__(self):
+        self.events = queue.Queue()
+        if sys.platform.startswith("linux"):
+            threading.Thread(target=self.read, daemon=True).start()
+
+    def read(self):
+        while True:
+            for path in sorted(glob.glob("/dev/input/js*")):
+                try:
+                    with open(path, "rb") as f:
+                        while True:
+                            data = f.read(8)
+                            if len(data) < 8:
+                                break
+                            _, value, kind, number = struct.unpack("IhBB",
+                                                                   data)
+                            if not kind & 0x80:     # skip the initial state
+                                self.events.put((kind, number, value))
+                except OSError:
+                    pass
+            time.sleep(2)                           # wait for one to appear
+
+
 # ── Persistence ──────────────────────────────────────────────────────────────
 
 def load_saved():
@@ -1646,6 +1703,8 @@ HELP = """PENULTIMATE
 Arrow keys / WASD   move; walk into monsters to fight
                     and into people to talk
 Space               wait a turn
+Tap or click        walk to a square; next to you: step,
+                    fight or talk; on you: wait
 F + direction       fire your hockey puck sling
 C + number          cast a spell (aimed ones then
                     ask for a direction)
@@ -1673,6 +1732,10 @@ puck slings and pucks; mages sell spellbooks. Nights
 are dark and dangerous, and only inns and taverns stay
 open. A night at the inn takes you to the morning.
 
+Gamepad (Linux, Steam Deck): d-pad or stick moves,
+A waits or chooses, B backs out, X sling, Y cast,
+LB potion, RB journal, View map, Start menu.
+
 Press any key to close."""
 
 
@@ -1684,13 +1747,19 @@ class Game:
         self.sound.muted = bool(saved.get("muted"))
         self.sound.music_off = bool(saved.get("music_off"))
         scale = saved.get("scale")
-        self.scale = scale if scale in (1, 2, 3, 4) else (
-            3 if root.winfo_screenheight() >= 1000 else 2)
+        if scale in range(1, MAX_ZOOM + 1):
+            self.scale = scale
+        elif ANDROID:           # tiles about a third of an inch across
+            dpi = root.winfo_fpixels("1i")
+            self.scale = max(3, min(MAX_ZOOM, round(dpi * 0.33 / 16)))
+        else:
+            self.scale = 3 if root.winfo_screenheight() >= 1000 else 2
 
         root.title("Penultimate")
         root.configure(bg=PANEL)
-        root.minsize(720, 560)
-        root.geometry("1180x860" if self.scale >= 3 else "980x720")
+        if not ANDROID:
+            root.minsize(720, 560)
+            root.geometry("1180x860" if self.scale >= 3 else "980x720")
 
         top = tk.Frame(root, bg=PANEL)
         top.pack(fill="x")
@@ -1707,16 +1776,14 @@ class Game:
         bar = tk.Frame(root, bg=PANEL)
         bar.pack(side="bottom", fill="x")
         self.btn = {}
-        for key, label, cmd in (("potion", "Potion", self.drink),
+        for key, label, cmd in (("wait", "Wait", self.wait),
+                                ("sling", "Sling", self.ready_sling),
+                                ("cast", "Cast", self.choose_spell),
+                                ("potion", "Potion", self.drink),
                                 ("map", "Map", self.toggle_map),
                                 ("journal", "Journal", self.journal),
-                                ("help", "Help", self.show_help),
-                                ("out", "Zoom -", lambda: self.zoom(-1)),
-                                ("in", "Zoom +", lambda: self.zoom(1)),
-                                ("mute", "Sound: on", self.toggle_mute),
-                                ("music", "Music: on", self.toggle_music),
-                                ("new", "New Game", self.ask_new_game)):
-            b = tk.Button(bar, text=label, command=cmd, width=9,
+                                ("menu", "Menu", self.action_menu)):
+            b = tk.Button(bar, text=label, command=cmd, width=8,
                           highlightbackground=PANEL, takefocus=0)
             b.pack(side="left", expand=True, pady=6)
             self.btn[key] = b
@@ -1769,11 +1836,14 @@ class Game:
         self.talk = None            # {"mob", "mode"} while in a conversation
         self.busy = False           # dying or a missile flying: no input
         self.aim = None             # waiting for a direction to fire in
-        self.picking = False        # waiting for a spell's number
+        self.menu = None            # a menu shown on the map, if any
+        self.menu_rows = []         # where its rows are, for taps
+        self.walking = None         # squares left to walk to a tapped spot
         self.visible = set()
         self.cache = {}
 
         self.canvas.bind("<Configure>", lambda e: self.layout())
+        self.canvas.bind("<ButtonPress-1>", self.on_tap)
         root.bind("<KeyPress>", self.on_key)
         for k in ("Control-q", "Command-q"):
             root.bind("<%s>" % k, lambda e: self.quit())
@@ -1785,6 +1855,93 @@ class Game:
             self.new_game()
         self.music_tick()
         self.animate()
+        self.pad = Gamepad()
+        self.pad_dir = None         # direction held on the d-pad or stick
+        self.pad_axes = {}
+        self.pad_poll()
+
+    def pad_poll(self):
+        """Turn gamepad events into actions."""
+        while True:
+            try:
+                kind, number, value = self.pad.events.get_nowait()
+            except queue.Empty:
+                break
+            name = PAD_BUTTONS.get(number) if kind & 1 else None
+            if name in ("left", "right", "up", "down"):
+                self.pad_hold({"left": (-1, 0), "right": (1, 0), "up": (0, -1),
+                               "down": (0, 1)}[name] if value else None)
+            elif name and value:
+                self.pad_button(name)
+            elif kind & 2 and number in PAD_STICK + PAD_HAT:
+                self.pad_axes[number] = value
+                held = None
+                for ax, ay in (PAD_HAT, PAD_STICK):
+                    vx, vy = self.pad_axes.get(ax, 0), self.pad_axes.get(ay, 0)
+                    if max(abs(vx), abs(vy)) > PAD_DEADZONE:
+                        held = ((1 if vx > 0 else -1, 0) if abs(vx) >= abs(vy)
+                                else (0, 1 if vy > 0 else -1))
+                        break
+                if held != self.pad_dir:
+                    self.pad_hold(held)
+        self.root.after(30, self.pad_poll)
+
+    def pad_hold(self, d):
+        """A direction pressed (or let go): act now, then repeat while held."""
+        self.pad_dir = d
+        if d:
+            self.pad_direction(d)
+            self.root.after(350, self.pad_repeat, d)
+
+    def pad_repeat(self, d):
+        if self.pad_dir == d:
+            self.pad_direction(d)
+            self.root.after(160, self.pad_repeat, d)
+
+    def pad_direction(self, d):
+        self.walking = None
+        if self.menu:
+            self.menu_move(-1 if d in ((0, -1), (-1, 0)) else 1)
+        elif self.busy or self.talk:
+            pass
+        elif self.overlay:
+            if self.overlay != "won":
+                self.overlay = None
+                self.render()
+        elif self.aim:
+            self.fire(*d)
+        else:
+            self.move(*d)
+
+    def pad_button(self, name):
+        """A: choose, or wait a turn. B: back. X: sling. Y: cast.
+        LB: potion. RB: journal. View: map. Start: the menu."""
+        self.walking = None
+        if self.busy:
+            return
+        if self.menu:
+            if name == "a":
+                self.menu_pick()
+            elif name == "b":
+                self.menu_cancel()
+            return
+        if self.talk:
+            return
+        if self.overlay:
+            if self.overlay == "won" or name == "start":
+                self.action_menu()
+            else:
+                self.overlay = None
+                self.render()
+            return
+        if self.aim:
+            if name == "b":
+                self.aim = None
+                self.say("Never mind.", "info")
+            return
+        {"a": self.wait, "x": self.ready_sling, "y": self.choose_spell,
+         "lb": self.drink, "rb": self.journal, "view": self.toggle_map,
+         "start": self.action_menu}.get(name, lambda: None)()
 
     def animate(self):
         """Flip every animated square to its other frame, twice a second."""
@@ -1948,7 +2105,8 @@ class Game:
         self.end_talk()
         self.busy = False
         self.aim = None
-        self.picking = False
+        self.menu = None
+        self.walking = None
         self.log.config(state="normal")
         self.log.delete("1.0", "end")
         self.log.config(state="disabled")
@@ -2106,15 +2264,26 @@ class Game:
         if self.talk or self.busy or ev.state & 0x0C:
             return
         k = ev.keysym
+        self.walking = None
+        if self.menu:
+            k = k[3:] if k.startswith("KP_") else k
+            if k in ("Up", "w", "Left", "a"):
+                self.menu_move(-1)
+            elif k in ("Down", "s", "Right", "d", "Tab"):
+                self.menu_move(1)
+            elif k in ("Return", "space", "KP_Enter"):
+                self.menu_pick()
+            elif k.isdigit() and 1 <= int(k) <= len(self.menu["items"]):
+                self.menu_pick(int(k) - 1)
+            else:
+                self.menu_cancel()
+            return
         if self.overlay:
             if self.overlay == "won" and k in ("n", "N"):
                 self.new_game()
             elif self.overlay != "won" or k in ("Escape", "Return"):
                 self.overlay = None
                 self.render()
-            return
-        if self.picking:
-            self.pick_spell(k)
             return
         if self.aim:
             if k in MOVE_KEYS:
@@ -2130,8 +2299,7 @@ class Game:
         elif k in ("c", "C"):
             self.choose_spell()
         elif k in ("space", "period", "KP_5"):
-            self.say("You wait.", "info")
-            self.end_turn()
+            self.wait()
         elif k in ("p", "P"):
             self.drink()
         elif k in ("m", "M"):
@@ -2152,7 +2320,7 @@ class Game:
             self.ask_new_game()
 
     def move(self, dx, dy):
-        if self.busy or self.talk or self.overlay:
+        if self.busy or self.talk or self.overlay or self.menu:
             return
         a = self.area
         x, y = self.pos[0] + dx, self.pos[1] + dy
@@ -2649,10 +2817,195 @@ class Game:
         self.say(msg + "!", "gold")
         self.sound.play("gold")
 
+    # ── Menus, taps and walking ──
+
+    def open_menu(self, title, items, cancel=None):
+        """A list of choices drawn over the map: arrow keys, taps, a
+        gamepad or a number pick one."""
+        self.menu = {"title": title, "items": items, "sel": 0,
+                     "cancel": cancel}
+        self.render()
+
+    def menu_move(self, d):
+        m = self.menu
+        m["sel"] = (m["sel"] + d) % len(m["items"])
+        self.render()
+
+    def menu_pick(self, i=None):
+        m, self.menu = self.menu, None
+        self.render()
+        m["items"][m["sel"] if i is None else i][1]()
+
+    def menu_cancel(self):
+        m, self.menu = self.menu, None
+        self.render()
+        if m["cancel"]:
+            m["cancel"]()
+
+    def draw_menu(self):
+        c, m = self.canvas, self.menu
+        W, H = c.winfo_width(), c.winfo_height()
+        if not hasattr(self, "menu_fonts"):
+            size = 17 if ANDROID else 14
+            self.menu_fonts = (tkfont.Font(family="Helvetica", size=size),
+                               tkfont.Font(family="Helvetica", size=size,
+                                           weight="bold"))
+        f, bold = self.menu_fonts
+        rh = f.metrics("linespace") + (18 if ANDROID else 10)
+        labels = [label for label, _ in m["items"]]
+        bw = min(W - 20, max([f.measure(t) for t in labels] +
+                             [bold.measure(m["title"])]) + 40)
+        fit = max(1, (H - 3 * rh) // rh)          # scroll long lists
+        first = max(0, min(m["sel"] - fit // 2, len(labels) - fit))
+        shown = labels[first:first + fit]
+        bh = (len(shown) + 1) * rh + 16
+        x0, y0 = (W - bw) // 2, max(8, (H - bh) // 2)
+        c.create_rectangle(x0, y0, x0 + bw, y0 + bh, fill=PANEL,
+                           outline=ACCENT, width=2, tags="overlay")
+        c.create_text(x0 + 20, y0 + 8 + rh // 2, text=m["title"], anchor="w",
+                      fill=ACCENT, font=bold, tags="overlay")
+        self.menu_rows = []
+        for n, label in enumerate(shown):
+            i = first + n
+            ry = y0 + 8 + (n + 1) * rh
+            if i == m["sel"]:
+                c.create_rectangle(x0 + 6, ry, x0 + bw - 6, ry + rh,
+                                   fill="#3a2f1c", outline="",
+                                   tags="overlay")
+            c.create_text(x0 + 20, ry + rh // 2, text=label, anchor="w",
+                          fill=INK, font=f, tags="overlay")
+            self.menu_rows.append((x0, ry, x0 + bw, ry + rh, i))
+
+    def on_tap(self, ev):
+        """A tap or click on the map."""
+        self.walking = None
+        if self.menu:
+            for x0, y0, x1, y1, i in self.menu_rows:
+                if x0 <= ev.x <= x1 and y0 <= ev.y <= y1:
+                    self.menu_pick(i)
+                    return
+            if not self.talk:
+                self.menu_cancel()
+            return
+        if self.busy or self.talk:
+            return
+        if self.overlay:
+            if self.overlay == "won":
+                self.action_menu()
+            else:
+                self.overlay = None
+                self.render()
+            return
+        cols, rows, ox, oy, ts = self.view
+        tx = self.pos[0] - cols // 2 + (ev.x - ox) // ts
+        ty = self.pos[1] - rows // 2 + (ev.y - oy) // ts
+        dx, dy = tx - self.pos[0], ty - self.pos[1]
+        step = ((1 if dx > 0 else -1, 0) if abs(dx) >= abs(dy)
+                else (0, 1 if dy > 0 else -1))
+        if self.aim:
+            if (dx, dy) == (0, 0):
+                self.aim = None
+                self.say("Never mind.", "info")
+            else:
+                self.fire(*step)
+        elif (dx, dy) == (0, 0):
+            self.wait()
+        elif abs(dx) + abs(dy) == 1:
+            self.move(dx, dy)
+        else:
+            self.walk_to(tx, ty)
+
+    def passable(self, x, y, goal):
+        """Can a tapped-for walk go through this square?"""
+        a, p = self.area, self.p
+        if not a.inside(x, y):
+            return False
+        if (x, y) == goal:
+            return True
+        t = a.grid[y][x]
+        if a.mob_at(x, y) or a.items.get((x, y)) == "trap":
+            return False
+        if a.kind == "world" and t in WATER:
+            return p["canoe"] or p["beaver"]
+        return t in WALKABLE and t not in (
+            "town", "castle", "dungeon", "lair", "stairs_up", "stairs_down",
+            "lava")
+
+    def walk_to(self, tx, ty):
+        """Walk to a tapped square, a step at a time, stopping when a new
+        monster comes into view."""
+        start, goal = tuple(self.pos), (tx, ty)
+        prev = {start: None}
+        q = deque([start])
+        while q and goal not in prev:
+            x, y = q.popleft()
+            if abs(x - start[0]) + abs(y - start[1]) > 40:
+                continue
+            for dx, dy in DIRS:
+                n = (x + dx, y + dy)
+                if n not in prev and self.passable(n[0], n[1], goal):
+                    prev[n] = (x, y)
+                    q.append(n)
+        if goal not in prev:
+            self.say("You can't find a way there.", "info")
+            return
+        path = []
+        while goal != start:
+            path.append(goal)
+            goal = prev[goal]
+        self.walking = path[::-1]
+        self.walk_area = self.area
+        self.walk_seen = self.hostiles_in_view()
+        self.walk_step()
+
+    def hostiles_in_view(self):
+        return {id(m) for m in self.area.mobs
+                if m.hostile and (m.x, m.y) in self.visible}
+
+    def walk_step(self):
+        if (not self.walking or self.busy or self.talk or self.menu or
+                self.overlay or self.area is not self.walk_area):
+            self.walking = None
+            return
+        x, y = self.walking.pop(0)
+        before = tuple(self.pos)
+        self.move(x - before[0], y - before[1])
+        if (tuple(self.pos) != (x, y) or self.hostiles_in_view() -
+                self.walk_seen):
+            self.walking = None       # blocked, or something to deal with
+            return
+        if self.walking:
+            self.root.after(110, self.walk_step)
+
+    def wait(self):
+        if self.busy or self.talk or self.overlay or self.menu:
+            return
+        self.say("You wait.", "info")
+        self.end_turn()
+
+    def action_menu(self):
+        """Everything without a button of its own."""
+        if self.busy or self.talk:
+            return
+        self.overlay = None
+        self.open_menu("Penultimate", [
+            ("Help", self.show_help),
+            ("Map", self.toggle_map),
+            ("Journal", self.journal),
+            ("Zoom in", lambda: self.zoom(1)),
+            ("Zoom out", lambda: self.zoom(-1)),
+            ("Sound effects: %s" % ("off" if self.sound.muted else "on"),
+             self.toggle_mute),
+            ("Music: %s" % ("off" if self.sound.music_off else "on"),
+             self.toggle_music),
+            ("New game", self.ask_new_game),
+            ("Quit (the game is saved)", self.quit),
+            ("Back to the game", lambda: None)])
+
     # ── Magic and missiles ──
 
     def choose_spell(self):
-        if self.busy or self.talk or self.overlay:
+        if self.busy or self.talk or self.overlay or self.menu:
             return
         p = self.p
         if p["beaver"]:
@@ -2663,21 +3016,12 @@ class Game:
             self.say("You know no spells. The mages in the towns sell "
                      "spellbooks.", "info")
             return
-        self.say("Cast which spell? (you have %d MP)" % p["mp"], "info")
-        for i, n in enumerate(p["spells"], 1):
-            self.say("   %d) %-10s %2d MP  %s" % (i, n, SPELLS[n].mp,
-                                                 SPELLS[n].desc), "talk")
-        self.say("   (press its number, or Escape)", "info")
-        self.picking = True
-
-    def pick_spell(self, k):
-        self.picking = False
-        k = k[3:] if k.startswith("KP_") else k
-        spells = self.p["spells"]
-        if k.isdigit() and 1 <= int(k) <= len(spells):
-            self.cast(spells[int(k) - 1])
-        else:
-            self.say("Never mind.", "info")
+        self.open_menu(
+            "Cast which spell? (you have %d MP)" % p["mp"],
+            [("%d) %s  (%d MP): %s" % (i, n, SPELLS[n].mp, SPELLS[n].desc),
+              lambda n=n: self.cast(n))
+             for i, n in enumerate(p["spells"], 1)],
+            lambda: self.say("Never mind.", "info"))
 
     def cast(self, name):
         p, a = self.p, self.area
@@ -2733,7 +3077,7 @@ class Game:
         self.end_turn()
 
     def ready_sling(self):
-        if self.busy or self.talk or self.overlay:
+        if self.busy or self.talk or self.overlay or self.menu:
             return
         p = self.p
         if p["beaver"]:
@@ -2889,7 +3233,7 @@ class Game:
         self.sound.play("gold")
 
     def drink(self):
-        if self.busy or self.talk or self.overlay:
+        if self.busy or self.talk or self.overlay or self.menu:
             return
         p = self.p
         if p["potions"] <= 0:
@@ -2910,6 +3254,7 @@ class Game:
 
     def npc_say(self, mob, text):
         self.say("%s says: %s" % (self.speaker(mob), text), "talk")
+        self.heard = re.findall(r"\b[A-Z]{3,}\b", text)
 
     def start_talk(self, mob):
         if mob.goose is not None:
@@ -2919,7 +3264,8 @@ class Game:
         self.talkbar.pack(side="bottom", fill="x", before=self.log)
         self.prompt.config(text="Your interest:")
         self.entry.delete(0, "end")
-        self.entry.focus_set()
+        if not ANDROID:             # don't pop up the on-screen keyboard
+            self.entry.focus_set()
         if self.p["beaver"] and not mob.lord:
             self.beaver_talk(mob)
             return
@@ -2927,6 +3273,8 @@ class Game:
             self.lord_greet(mob)
             if self.overlay == "won":
                 self.end_talk()
+            else:
+                self.talk_menu()
             return
         self.say("You meet %s." % mob.title, "info")
         greet = mob.greet
@@ -2944,9 +3292,10 @@ class Game:
             self.finish_errand(mob)
         if "talked" not in self.flags:
             self.flags.add("talked")
-            self.say("(Type a word such as NAME, JOB or NEWS and press "
-                     "Return. BYE, or an empty line, ends the "
-                     "conversation.)", "info")
+            self.say("(Choose what to ask about, or type a word such as "
+                     "NAME, JOB or NEWS and press Return. BYE, or an empty "
+                     "line, ends the conversation.)", "info")
+        self.talk_menu()
 
     def beaver_talk(self, mob):
         """Nobody understands a beaver; there is no conversation."""
@@ -2970,7 +3319,44 @@ class Game:
         return (mob.shop is not None and self.phase() == "night"
                 and mob.shop["kind"] not in ("inn", "tavern"))
 
+    def talk_menu(self):
+        """What to say next, as a menu for taps and gamepads (typing a word
+        works as before)."""
+        t = self.talk
+        if not t:
+            return
+        mob = t["mob"]
+        if t["mode"] == "buy":
+            items = [("%d) %s, %d gold" % (i, label, price),
+                      lambda i=i: self.choose_words(str(i)))
+                     for i, (label, price, _, _) in
+                     enumerate(self.offers(mob), 1)]
+            items.append(("Nothing, thanks", lambda: self.choose_words("")))
+            self.open_menu("Buy what? (you have %d gold)" % self.p["gold"],
+                           items, lambda: self.choose_words(""))
+            return
+        words = ["NAME", "JOB"]
+        if mob.lord:
+            words += ["QUEST", "MOOSEDAIN", "LEVEL"]
+        else:
+            words += ["NEWS"] + (["BUY"] if mob.shop else []) + (
+                ["HELP"] if mob.quest is not None else [])
+        for w in getattr(self, "heard", []):
+            if w not in words and w != "BYE":
+                words.append(w)
+        self.open_menu("Ask %s about:" % self.speaker(mob).lower()
+                       if not mob.known else "Ask %s about:" % mob.name,
+                       [(w, lambda w=w: self.choose_words(w))
+                        for w in words + ["BYE"]],
+                       lambda: self.choose_words("bye"))
+
+    def choose_words(self, w):
+        self.say("> " + (w or "nothing"), "you")
+        self.converse(w.lower())
+        self.talk_menu()
+
     def end_talk(self):
+        self.menu = None
         self.talk = None
         self.talkbar.pack_forget()
         self.canvas.focus_set()
@@ -2984,6 +3370,7 @@ class Game:
             return
         self.say("> " + (text or "bye"), "you")
         self.converse(text.lower())
+        self.talk_menu()
 
     def converse(self, w):
         t = self.talk
@@ -3618,6 +4005,8 @@ class Game:
                 "Escape to keep wandering." % (
                     self.world["realm"], self.p["level"], self.turn),
                 ACCENT)
+        if self.menu:
+            self.draw_menu()
         self.render_chrome()
 
     def flash(self, x, y, tile="hit"):
@@ -3729,10 +4118,6 @@ class Game:
         if 0 < p["hp"] <= self.max_hp() // 4:
             cond.append("BADLY HURT")
         self.condition.config(text="\n".join(cond))
-        self.btn["mute"].config(
-            text="Sound: off" if self.sound.muted else "Sound: on")
-        self.btn["music"].config(
-            text="Music: off" if self.sound.music_off else "Music: on")
         self.sound.tune = self.area.kind
 
     # ── Commands ──
@@ -3750,7 +4135,7 @@ class Game:
         self.render()
 
     def zoom(self, d):
-        s = min(4, max(1, self.scale + d))
+        s = min(MAX_ZOOM, max(1, self.scale + d))
         if s != self.scale:
             self.scale = s
             self.scale_images()

@@ -49,6 +49,41 @@ To build a macOS app with an icon:
 | N | New game (a whole new world) |
 | Ctrl-Q / Cmd-Q | Quit |
 
+### Touch, mouse and gamepad
+
+The game plays without a keyboard. **Tap or click** a square to walk there
+(you stop if a monster comes into view), tap next to yourself to step,
+fight or talk, and tap yourself to wait. When aiming the sling or a spell,
+tap in the direction to fire. Spells, shopping and conversation topics
+appear as menus to tap. The buttons below the map (Wait, Sling, Cast,
+Potion, Map, Journal, Menu) cover the rest, with Menu holding help, zoom,
+sound, music, new game and quit.
+
+**Android:** install [Pydroid 3](https://play.google.com/store/apps/details?id=ru.iiec.pydroid3),
+open `penultimate` in it and run it. Tiles are scaled up for phone screens,
+and the on-screen keyboard only appears if you tap the box to type. There
+is no sound on Android.
+
+**Gamepad (Linux, including the Steam Deck):** the game reads the
+joystick device directly, so an Xbox-style pad works with nothing to
+install. On a Steam Deck, add `penultimate` to Steam as a non-Steam game
+and use the Gamepad controller layout.
+
+| Button | Action |
+| --- | --- |
+| D-pad / left stick | Move (hold to keep going); move through menus; aim |
+| A | Wait a turn; choose in a menu |
+| B | Back: close a menu, map or help; stop aiming; say bye |
+| X | Fire the sling |
+| Y | Cast a spell |
+| LB | Drink a potion |
+| RB | Journal |
+| View | Map |
+| Start | Menu |
+
+Other pads may number their buttons differently; `PAD_BUTTONS` near the
+top of the gamepad code maps them.
+
 **Talking.** Walk into a person, or into a shop counter with someone behind
 it, then type a word and press Return. Everyone knows NAME, JOB and BYE;
 most people know NEWS, and words they say in CAPITALS are worth asking

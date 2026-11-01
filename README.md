@@ -79,6 +79,12 @@ castle).
 serpents permitting). Islands off the coast hold inukshuks with gifts
 beneath them.
 
+**Dungeons** come in kinds: torchlit stone halls, ice caves where slick
+ice sends you sliding, flooded mines whose pools slow you down, and lava
+caverns that burn. Every level hides traps (pits, poisoned darts and alarm
+bells), and nimble heroes spot them sooner. Some levels lock the stairs or
+the boss behind gates; the key is somewhere else on the level.
+
 **Day and night.** Time passes as you play. At night you can't see as far,
 more and fiercer monsters roam, and only inns and taverns stay open. A
 night at the inn wakes you at 8 am. The Light spell helps in the dark.
@@ -97,12 +103,14 @@ when you quit, and it resumes next time.
 
 ## Files
 
-- `penultimate`: the game. The tile graphics (16×16 pixel art) are stored
-  in it as base64 PNGs in `TILE_PNG`, and the app icon as `ICON_PNG`.
+- `penultimate`: the game. The tile graphics (16×16 pixel art, with a
+  second animation frame for creatures, water and flames) are stored in it
+  as base64 PNGs in `TILE_PNG`, and the app icon as `ICON_PNG`.
 - `make_tiles.py`: the pixel-art source for the tiles. Edit the art there
   and run it to rewrite the `TILE_PNG` and `ICON_PNG` blocks in
   `penultimate`; `./make_tiles.py --sheet sheet.png` also writes a preview
-  of every tile.
+  of every tile. The dungeon themes and the animation frames are generated
+  there from the base tiles.
 
 The music is four original chiptune loops written as note data in the
 `MUSIC` table. They are synthesized on first run and cached in

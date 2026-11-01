@@ -29,7 +29,11 @@ start with a hockey puck sling.  Outfitters sell canoes (carry one and you
 can paddle onto any water), slings and pucks; mages sell spellbooks.  Days
 pass as you play: at night you see less, more monsters prowl, and only inns
 and taverns stay open.  Islands off the coast hold inukshuks with gifts
-beneath them.  Townsfolk who need HELP offer errands: slaying monsters,
+beneath them.  Dungeons come in kinds: torchlit stone halls, ice caves with slick ice
+that sends you sliding, flooded mines whose pools slow you down, and lava
+caverns.  Hidden traps lurk on every level (the nimble spot them sooner),
+and some levels lock their stairs or their boss behind gates whose key lies
+elsewhere on the level.  Townsfolk who need HELP offer errands: slaying monsters,
 fetching stolen things from dungeons, catching runaway geese and carrying
 parcels to other towns.
 
@@ -85,17 +89,20 @@ SAVE_FILE = os.path.expanduser("~/.penultimate.json")
 WALKABLE = {"grass", "forest", "hills", "swamp", "sand", "town", "castle",
             "dungeon", "lair", "stone", "cobble", "wood", "carpet", "throne",
             "door", "dfloor", "stairs_up", "stairs_down", "chest",
-            "inukshuk"}
+            "inukshuk", "slick", "pool", "lava"}
 OPAQUE = {"world": {"forest", "mountain"}, "town": {"brick", "door"},
-          "castle": {"brick", "door"}, "dungeon": {"dwall"}}
+          "castle": {"brick", "door"}, "dungeon": {"dwall", "torch"}}
 LAND = {"grass", "forest", "hills", "swamp", "sand"}      # wilderness
 WATER = {"deep", "water"}
-DUNGEON_FLOOR = {"dfloor", "stairs_up", "stairs_down"}
+DUNGEON_FLOOR = {"dfloor", "stairs_up", "stairs_down", "slick", "pool"}
+# Each dungeon has a theme: its look, and a hazard of its own
+THEMED = ("dwall", "dfloor", "chest", "stairs_up", "stairs_down")
+HAZARDS = {"ice": "slick", "mine": "pool", "lava": "lava", "lair": "lava"}
 SPRITES = {"avatar", "lord", "guard", "man", "woman", "merchant", "jester",
            "rat", "bat", "snake", "slime", "wolf", "goblin", "orc",
            "skeleton", "spider", "troll", "ghost", "daemon", "dragon",
            "serpent", "moosedain", "witch", "beaver", "wizard", "canoe",
-           "goose", "hit", "bolt", "puck", "frost"}
+           "goose", "hit", "bolt", "puck", "frost", "key", "trap"}
 SITE_COLORS = {"town": "#ff5040", "castle": "#ffffff", "dungeon": "#ffa020",
                "lair": "#d040ff"}
 DIRS = ((0, -1), (0, 1), (-1, 0), (1, 0))
@@ -157,7 +164,7 @@ MONSTERS = {
                       "ranged"),
     "witch": Monster("wood witch", "witch", 3, 18, (2, 6), 2, 35, "forest",
                      "curse"),
-    "moosedain": Monster("Moosedain", "moosedain", 8, 180, (8, 20), 7, 1000,
+    "moosedain": Monster("Moosedain", "moosedain", 8, 260, (10, 22), 7, 1000,
                          "none", "ranged"),
 }
 BOSS_TYPES = (("orc", "goblin"), ("spider", "skeleton"), ("troll", "ghost"),
@@ -201,7 +208,7 @@ SPELLS = {
     "Heal": Spell(4, 60, False, "heals 8 + Int hit points"),
     "Cure": Spell(2, 40, False, "cures poison"),
     "Light": Spell(3, 50, False, "lights the dark for 150 turns"),
-    "Frost Bolt": Spell(5, 120, True, "an icy bolt: 4-10 + Int/2 damage"),
+    "Frost Bolt": Spell(6, 120, True, "an icy bolt: 3-8 + Int/3 damage"),
     "Sorry": Spell(4, 100, False, "an apology so heartfelt that nearby "
                    "monsters flee"),
     "Portage": Spell(12, 300, False, "carries thee home to Castle Canadian"),
@@ -209,10 +216,11 @@ SPELLS = {
 PUCK_DMG = (2, 6)
 PUCK_RANGE = 6
 BOLT_RANGE = 7
+BOLT_DMG = (3, 8)
 
 
 def max_mp(p):
-    return max(0, p["int"] - 5) * 2 + 2 * p["level"]
+    return max(0, p["int"] - 6) * 3 // 2 + 2 * p["level"]
 MAX_LEVEL = 10
 BEAVER_HP = 12                  # a beaver's most hit points
 BEAVER_BITE = (1, 3)            # and its damage
@@ -708,6 +716,11 @@ class Area:
         self.dark = False           # limited light, remembered tiles
         self.seen = bytearray(self.w * self.h)
         self.opaque = OPAQUE[kind]
+        self.skin = {}              # tile -> the tile drawn for it (themes)
+        self.items = {}             # (x, y) -> "key" or a spotted "trap"
+        self.traps = set()          # hidden traps
+        self.keys = 0               # keys found on this dungeon level
+        self.errand_chests = {}     # (x, y) -> id of the errand it is for
 
     def inside(self, x, y):
         return 0 <= x < self.w and 0 <= y < self.h
@@ -755,12 +768,17 @@ def make_monster(kind, x, y):
     return m
 
 
+BOSS_HP = (2.5, 3.5, 3.5, 2.5)        # by quest: the middle two need more
+
+
 def make_boss(d, di, x, y):
     m = make_monster(d["boss_type"], x, y)
     if not d["lair"]:
-        m.hp = m.maxhp = m.hp * 3
-        m.dmg = (m.dmg[0] + 2, m.dmg[1] + m.dmg[1] // 2)
-        m.defense += 2
+        # tuned with a fight simulator: a boss should cost about a full
+        # health bar (so a potion or two) for a player at the expected level
+        m.hp = m.maxhp = int(m.hp * BOSS_HP[d["quest"] or 0])
+        m.dmg = (m.dmg[0] + 1, m.dmg[1] + m.dmg[1] // 4)
+        m.defense += 1
         m.level += 1
         m.xp *= 5
     m.name, m.boss, m.dungeon = d["boss"], True, di
@@ -1104,7 +1122,6 @@ def make_dungeon_level(world, di, level, flags):
                 g[y][x] = "chest"
     if last and d["boss"] and "boss:%d" % di not in flags:
         area.mobs.append(make_boss(d, di, far[0], far[1]))
-    area.errand_chests = {}
     for q in world.get("side", []):
         if (q["kind"] == "fetch" and q["dungeon"] == di and
                 q["level"] == level and "item:" + q["id"] not in flags):
@@ -1114,9 +1131,72 @@ def make_dungeon_level(world, di, level, flags):
                                  ).choice(spots)
             g[y][x] = "chest"
             area.errand_chests[(x, y)] = q["id"]
+    furnish(world, area, d, di, level, rooms, centers)
     area.floor = [(x, y) for y in range(H) for x in range(W)
                   if g[y][x] == "dfloor"]
     return area
+
+
+def furnish(world, area, d, di, level, rooms, centers):
+    """Theme, hazards, torches, traps and a locked gate for a dungeon
+    level.  A random stream of its own keeps the layout itself unchanged."""
+    g = area.grid
+    H, W = area.h, area.w
+    rng = random.Random("%s:furnish:%d:%d" % (world["seed"], di, level))
+    theme = d.get("theme", "stone")
+    if theme != "stone":
+        area.skin = {t: "%s_%s" % (t, theme) for t in THEMED}
+    up, far = area.start, area.far
+    far_room = next(r for r, c in zip(rooms, centers) if c == far)
+
+    # Lock the far room (stairs down, or the boss) behind gates if it has
+    # few ways in, and leave a key somewhere outside it.
+    rx, ry, rw, rh = far_room
+    ring = [(x, y) for x in range(rx - 1, rx + rw + 1)
+            for y in range(ry - 1, ry + rh + 1)
+            if (x in (rx - 1, rx + rw)) != (y in (ry - 1, ry + rh))]
+    ways = [(x, y) for x, y in ring if g[y][x] == "dfloor"]
+    if 1 <= len(ways) <= 3 and rng.random() < 0.6:
+        for x, y in ways:
+            g[y][x] = "gate"
+        inside = {(x, y) for x in range(rx, rx + rw)
+                  for y in range(ry, ry + rh)}
+        spots = [(x, y) for y in range(H) for x in range(W)
+                 if g[y][x] == "dfloor" and (x, y) not in inside
+                 and abs(x - up[0]) + abs(y - up[1]) >= 4]
+        if spots:
+            area.items[rng.choice(spots)] = "key"
+        else:
+            for x, y in ways:
+                g[y][x] = "dfloor"
+
+    hazard = HAZARDS.get(theme)
+    if hazard:
+        for _ in range(rng.randint(2, 4)):
+            r = rng.choice(rooms)
+            if r == far_room or (up[0] - r[0]) in range(r[2]) and \
+                    (up[1] - r[1]) in range(r[3]):
+                continue
+            # never on the room's edge, so there is always a way round
+            iw, ih = r[2] - 2, r[3] - 2
+            bw, bh = rng.randint(1, min(4, iw)), rng.randint(1, min(3, ih))
+            bx = rng.randint(r[0] + 1, r[0] + 1 + iw - bw)
+            by = rng.randint(r[1] + 1, r[1] + 1 + ih - bh)
+            for y in range(by, by + bh):
+                for x in range(bx, bx + bw):
+                    if g[y][x] == "dfloor" and (x, y) not in centers \
+                            and (x, y) not in area.items:
+                        g[y][x] = hazard
+    if theme in ("stone", "lair"):
+        walls = [(x, y) for y in range(1, H - 1) for x in range(1, W - 1)
+                 if g[y][x] == "dwall" and g[y + 1][x] in DUNGEON_FLOOR]
+        for x, y in rng.sample(walls, min(len(walls), 10)):
+            g[y][x] = "torch"
+    spots = [(x, y) for y in range(H) for x in range(W)
+             if g[y][x] == "dfloor" and (x, y) not in centers
+             and (x, y) not in area.items
+             and abs(x - up[0]) + abs(y - up[1]) >= 5]
+    area.traps = set(rng.sample(spots, min(len(spots), 1 + level)))
 
 
 def dungeon_monster(d, level):
@@ -1674,6 +1754,7 @@ class Game:
         self.load_images()
         self.cells = []
         self.shown = []
+        self.frame = 0              # animation frame, 0 or 1
         self.view = (0, 0)
         self.fx_token = 0
         self.overlay = None         # None, "map", "help" or "won"
@@ -1695,6 +1776,32 @@ class Game:
         except (KeyError, TypeError, ValueError, IndexError, zlib.error):
             self.new_game()
         self.music_tick()
+        self.animate()
+
+    def animate(self):
+        """Flip every animated square to its other frame, twice a second."""
+        self.frame ^= 1
+        if self.cells and not self.overlay:
+            c = self.canvas
+            for idx, (base, top) in enumerate(self.shown):
+                nb, nt = self.framed(base), self.framed(top)
+                if (nb, nt) == (base, top):
+                    continue
+                self.shown[idx] = (nb, nt)
+                bid, tid = self.cells[idx]
+                if nb != base:
+                    c.itemconfig(bid, image=self.img[nb])
+                if nt != top:
+                    c.itemconfig(tid, image=self.img[nt])
+        self.root.after(450, self.animate)
+
+    def framed(self, name):
+        """The current animation frame of a tile name (None and remembered
+        "~" squares stay as they are)."""
+        if not name or name[0] == "~":
+            return name
+        root = name[:-2] if name.endswith("@1") else name
+        return root + "@1" if self.frame and root in self.animated else root
 
     def music_tick(self):
         self.sound.tick()
@@ -1709,7 +1816,7 @@ class Game:
         for name, data in TILE_PNG.items():
             img = tk.PhotoImage(data="".join(data))
             self.base[name] = img
-            if name in SPRITES:
+            if name.split("@")[0] in SPRITES:
                 continue
             rows, tot = [], [0, 0, 0]
             for y in range(16):
@@ -1732,6 +1839,7 @@ class Game:
     def scale_images(self):
         s = self.scale
         self.img = {n: i.zoom(s) for n, i in self.base.items()}
+        self.animated = {n for n in self.img if n + "@1" in self.img}
         self.dimg = {n: i.zoom(s) for n, i in self.dark.items()}
 
     # ── Game setup ──
@@ -1740,6 +1848,10 @@ class Game:
         self.world = generate_world(seed)
         place_inukshuks(self.world)
         make_side_quests(self.world)
+        themes = ["stone", "stone", "ice", "mine", "lava"]
+        random.Random("%s:themes" % seed).shuffle(themes)
+        for d, theme in zip(self.world["dungeons"], themes + ["lair"]):
+            d["theme"] = theme
         self.world_area = Area("world", ("world",), self.world["grid"],
                                self.world["realm"], "deep")
         self.cache = {}
@@ -1847,6 +1959,7 @@ class Game:
         self.p.update(g["player"])
         if self.p["weapon"] not in WEAPONS or self.p["armor"] not in ARMOURS:
             raise ValueError("bad equipment")
+        self.p["mp"] = min(self.p["mp"], max_mp(self.p))
         self.flags = set(g.get("flags", []))
         self.held = [int(i) for i in g.get("held", [])]
         self.returned = set(int(i) for i in g.get("returned", []))
@@ -2055,6 +2168,18 @@ class Game:
             if behind and not behind.hostile:
                 self.start_talk(behind)
                 return
+        if t == "gate":
+            if a.keys:
+                a.keys -= 1
+                a.grid[y][x] = "dfloor"
+                self.say("You unlock the gate with your iron key.", "good")
+                self.sound.play("door")
+                self.end_turn()
+            else:
+                self.say("The gate is locked. There must be a key somewhere "
+                         "on this level.", "info")
+                self.sound.play("bump")
+            return
         if t == "lair" and "final_quest" not in self.flags:
             self.say("A wall of enchanted ice seals the entrance to "
                      "Moosedain's lair. Perhaps Lord Canadian knows a way "
@@ -2080,6 +2205,9 @@ class Game:
         if site:
             self.enter_site(*site)
             return
+        if t == "slick":
+            x, y = self.slide(dx, dy)
+            t = a.grid[y][x]
         if t == "stairs_down":
             self.change_level(1)
             return
@@ -2094,7 +2222,76 @@ class Game:
             self.p["poison"] = True
             self.say("The swamp's foul vapours poison you!", "bad")
             self.sound.play("hurt")
+        wading = a.kind == "dungeon" and self.dungeon_step(x, y)
         self.end_turn()
+        if wading and not self.busy:
+            self.end_turn()             # wading is slow: monsters gain a turn
+
+    def slide(self, dx, dy):
+        """Slide across ice until something stops you."""
+        a = self.area
+        x, y = self.pos
+        moved = False
+        while a.grid[y][x] == "slick":
+            nx, ny = x + dx, y + dy
+            if (not a.inside(nx, ny) or a.grid[ny][nx] not in WALKABLE
+                    or a.mob_at(nx, ny)):
+                break
+            x, y, moved = nx, ny, True
+        self.pos = [x, y]
+        if moved:
+            self.say("Whee! You slide across the ice.", "info")
+        return x, y
+
+    def dungeon_step(self, x, y):
+        """Keys, traps and hazards underfoot; True if wading (slow)."""
+        a, p = self.area, self.p
+        if a.items.get((x, y)) == "key":
+            del a.items[(x, y)]
+            a.keys += 1
+            self.say("You pick up an iron key.", "gold")
+            self.sound.play("gold")
+        if (x, y) in a.traps or a.items.get((x, y)) == "trap":
+            a.traps.discard((x, y))
+            a.items[(x, y)] = "trap"
+            self.spring_trap(x, y)
+        t = a.grid[y][x]
+        if t == "lava":
+            tier = self.world["dungeons"][a.key[1]]["tier"]
+            dmg = random.randint(4, 8) + tier
+            p["hp"] -= dmg
+            self.say("The lava burns you! (%d)" % dmg, "bad")
+            self.flash(x, y, "bolt")
+            self.sound.play("hurt")
+        elif t == "pool":
+            self.say("You wade through the cold, dark water.", "info")
+            return True
+        return False
+
+    def spring_trap(self, x, y):
+        a, p = self.area, self.p
+        kind = random.choice(("pit", "dart", "alarm"))
+        self.sound.play("hurt")
+        if kind == "pit":
+            dmg = random.randint(3, 8) + a.key[2]
+            p["hp"] -= dmg
+            self.say("A trapdoor! You tumble into a spiked pit. (%d)" % dmg,
+                     "bad")
+            self.flash(x, y)
+        elif kind == "dart":
+            p["hp"] -= random.randint(1, 3)
+            p["poison"] = True
+            self.say("Click! A poisoned dart strikes you.", "bad")
+            self.flash(x, y)
+        else:
+            self.say("Click! A bell clangs somewhere in the dark. Monsters "
+                     "come running!", "bad")
+            d = self.world["dungeons"][a.key[1]]
+            spots = [s for s in a.floor if 4 <= abs(s[0] - x) +
+                     abs(s[1] - y) <= 8 and not a.mob_at(*s)]
+            for sx, sy in random.sample(spots, min(2, len(spots))):
+                a.mobs.append(make_monster(dungeon_monster(d, a.key[2]),
+                                           sx, sy))
 
     def bump(self):
         self.say("Blocked!", "info")
@@ -2137,6 +2334,14 @@ class Game:
         if p["hp"] <= 0:
             self.die()
             return
+        if a.kind == "dungeon":
+            px, py = self.pos
+            for tx, ty in list(a.traps):
+                if abs(tx - px) + abs(ty - py) <= 2 and \
+                        random.random() < p["dex"] * 0.015:
+                    a.traps.discard((tx, ty))
+                    a.items[(tx, ty)] = "trap"
+                    self.say("You spot a trap!", "info")
         self.render()               # monsters chase what they can see
         for mob in list(a.mobs):
             if mob not in a.mobs:
@@ -2538,7 +2743,7 @@ class Game:
             p["mp"] -= SPELLS[aim["spell"]].mp
             self.sound.play("spell")
             tile, reach = "frost", BOLT_RANGE
-            dmg = random.randint(4, 10) + p["int"] // 2
+            dmg = random.randint(*BOLT_DMG) + p["int"] // 3
             skill = p["int"] // 3
         else:
             p["pucks"] -= 1
@@ -2589,10 +2794,12 @@ class Game:
         elif random.randint(1, 20) + self.p["level"] + skill < \
                 10 + mob.defense:
             self.say("The %s misses %s." % (what, self.the(mob)), "info")
-        elif mob.kind == "moosedain":
+        elif mob.kind == "moosedain" and (tile == "puck" or
+                                          self.p["weapon"] != "Maple Blade"):
             self.flash(mob.x, mob.y)
-            self.say("The %s glances off Moosedain's enchanted hide!" % what,
-                     "bad")
+            self.say("The %s glances off Moosedain's enchanted hide!%s" % (
+                what, "" if tile == "puck" else " Perhaps with the Maple "
+                "Blade in hand..."), "bad")
         else:
             self.flash(mob.x, mob.y)
             mob.hp -= dmg
@@ -3308,18 +3515,19 @@ class Game:
                 x = x0 + i
                 base = top = None
                 if a.inside(x, y):
+                    t = a.grid[y][x]
                     if (x, y) in vis:
-                        base = a.grid[y][x]
+                        base = self.framed(a.skin.get(t, t))
                         m = mobs.get((x, y))
-                        if m:
-                            top = m.tile
+                        top = m.tile if m else a.items.get((x, y))
                     elif a.dark and a.seen[y * a.w + x]:
-                        base = "~" + a.grid[y][x]
+                        base = "~" + a.skin.get(t, t)
                 elif a.edge:
-                    base = a.edge
+                    base = self.framed(a.edge)
                 if x == px and y == py:
                     top = ("beaver" if self.p["beaver"] else "canoe"
                            if a.grid[y][x] in WATER else "avatar")
+                top = self.framed(top)
                 idx = j * cols + i
                 old = self.shown[idx]
                 if old == (base, top):
@@ -3913,6 +4121,43 @@ TILE_PNG = {
         "RFlIEYWxGgCS2NHgQRRGNoSBVM3ohsANWNEmTxLGMKA7ShsDwxRjkyNoAEijgIAAGGMzhPYu"
         "IISpH4jk4EGYF8jBABY51UZJJjRkAAAAAElFTkSuQmCC"
     ),
+    "torch": (
+        "iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAAf0lEQVR42mOIiIj4jwtraaj9"
+        "7+rqwivPAGKAFKFjmAJC8ngNeHHUnTgDsOFnFXJgA2CG4PQCiMCGYQaAaFxqMFyAHmjohmAL"
+        "UAZcgRZlIYWCcQUqA75Qh2nGFysYXkDmI9uOTR7sBXwBRAxmGNwpkWgD8DmRkDx1A5GYQEOX"
+        "BwAMBQd30Gxw/QAAAABJRU5ErkJggg=="
+    ),
+    "lava": (
+        "iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAAh0lEQVR42o2TQQqAMAwE9xEe"
+        "xbNnP+GXiv8TfIn4C6WFSiibbA45yKw1mVQc8/Re29rqLkur/lwZ48+5/xwM1rIHdW5Z52Av"
+        "j6HoA6kOojGRcWAzI4MKqMPhBUaB3nhQASU4JTHsQM0pHSiJioHJYh14oqGuqsfDLWQ34W6B"
+        "3Qf3X2CSlETLP0ecRglyaX2+AAAAAElFTkSuQmCC"
+    ),
+    "slick": (
+        "iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAAUklEQVR42mP4TyFgABF5Sz+A"
+        "MdkGEDJk170PhA0g1yUMpDoZ3QIGUjVjNQCfHwl5j4Eq0UjInyQZQExMIHuZ/tFItgEEY4Hc"
+        "qCQrJSIbQnEYAAARSuTedtVc1wAAAABJRU5ErkJggg=="
+    ),
+    "pool": (
+        "iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAAdUlEQVR42mNICrD6X5bkAcfo"
+        "fEJiDMgCGlH7CGKsBmDTnLf0A0FD4AYQYzM2Q0AWoxiAz1Zs8mAXEOt3XK4g6AVCYUF2GIAw"
+        "OAxIjQGKXYBsOMVewJuQCHkHJSGR4wqMvEBOfoAnJPSchisHYpNjIEYDviwNAHY0NORBx61N"
+        "AAAAAElFTkSuQmCC"
+    ),
+    "gate": (
+        "iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAAOklEQVR42mPQ0lD7TwlmABEn"
+        "TpyAC5DKHgQGgDiUYLALurq64CaSyh4OgUgVAygKRKpE4xAPA0qzMwAYBhi5zyBnuQAAAABJ"
+        "RU5ErkJggg=="
+    ),
+    "key": (
+        "iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAALElEQVR42mNgGAXUBy+Ouv+H"
+        "YbI04zIMGyZowIo2+f+41OB0IUVeGAVDFQAAE3s3Y0vMvUoAAAAASUVORK5CYII="
+    ),
+    "trap": (
+        "iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAAQUlEQVR42mNgGAUYQEBA4D8+"
+        "TFCzloba/xMnToBpGEbm4zQEphmXRmSM1RBcthPtCqq5gFAYkBwORNlOtWgcoQAAHQSCLWWO"
+        "EdkAAAAASUVORK5CYII="
+    ),
     "avatar": (
         "iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAAeklEQVR42mNgoBWIspD6j4wp"
         "0kyyISDFHw5MQMHoBpw4cQK3gSANAgICcM0wNkkGYMNEGwAz5ISRBhija8ZrgEbUvv/4MF4D"
@@ -4078,6 +4323,280 @@ TILE_PNG = {
         "iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAAOUlEQVR42mNgGJ7gWYXcf2RM"
         "luYXR93BmCSDkDXDALpBBA1A1oxsCNEuoNgAirxAcSBSJRpHAekAAKsNo4WhEiSoAAAAAElF"
         "TkSuQmCC"
+    ),
+    "dwall_ice": (
+        "iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAASklEQVR42mOoWHXpPy5sl9Lz"
+        "f9e9D3jlGUAMkCJ0DFNASJ46BuBzIiF5BhBBCWYgNdDQ5RlI9TO6POUGkBpo6GLUDcTRlDhA"
+        "KREAgingC1DeXaEAAAAASUVORK5CYII="
+    ),
+    "dfloor_ice": (
+        "iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAAU0lEQVR42mPYdO7Rf0owA4g4"
+        "9+QTZQYQg+1Sesg3AJdmrAYQ6x2YOgaqBCI+JxIdiPgMwect6niBVIzsWrJjgSgXEBO4DJQk"
+        "IpLDAJv36JeZcGEAsL5akEBMkmQAAAAASUVORK5CYII="
+    ),
+    "chest_ice": (
+        "iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAAVUlEQVR42mPYdO7Rf0oww+Ay"
+        "IMpCiiiM1QCQxI4GD6IwsiEMpGpGNwRuwIo2eZIwhgHdUdoYGKYYmxxBA0AaBQQEwBibIbR3"
+        "ASFM/UAkBw/CvEAOBgA10q+Z18jOfwAAAABJRU5ErkJggg=="
+    ),
+    "stairs_up_ice": (
+        "iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAATUlEQVR42mPYdO7Rf0owA7EK"
+        "u6O0/0dZSNHZAJAmZEyWASBNyJgsA0gKRGKcTdAAQs4mygCS0gGpzsZqACnOxmkA2UmZYgPo"
+        "kploZgAAduwhhlecT+0AAAAASUVORK5CYII="
+    ),
+    "stairs_down_ice": (
+        "iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAAWklEQVR42mPYdO7Rf0owA4io"
+        "WHWJLIxiwIkTJ0jCGAbsuveBaIzVBXYpPSRhiryA1QWkOB+rC+jiBZjTsRpAivPp7wVkp+M0"
+        "gFin4zRAQECAJIxhAEWZiRIMALEz9/3N1LaaAAAAAElFTkSuQmCC"
+    ),
+    "dwall_mine": (
+        "iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAASUlEQVR42mMoCLL4jwvbaMn8"
+        "78nywCvPAGKAFKFjmAJC8tQxAJ8TCckzgAhKMAOpgYYuz0Cqn9HlKTeA1EBDF6NuII6mxAFK"
+        "iQD3/+fozmxv8AAAAABJRU5ErkJggg=="
+    ),
+    "dfloor_mine": (
+        "iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAAUklEQVR42mNICrD6TwlmABFl"
+        "SR6UGUAMttGSId8AXJqxGkCsd2DqGKgSiPicSHQg4jMEn7eo4wVSMbJryY4FolxATOAyUJKI"
+        "SA4DbN6jX2bChQFuBemWFFMIIgAAAABJRU5ErkJggg=="
+    ),
+    "chest_mine": (
+        "iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAAVElEQVR42mNICrD6TwlmGFwG"
+        "RFlIEYWxGgCS2NHgQRRGNoSBVM3ohsANWNEmTxLGMKA7ShsDwxRjkyNoAEijgIAAGGMzhPYu"
+        "IISpH4jk4EGYF8jBAKDy/U5KvyMDAAAAAElFTkSuQmCC"
+    ),
+    "stairs_up_mine": (
+        "iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAATUlEQVR42mNICrD6TwlmIFZh"
+        "d5T2/ygLKTobANKEjMkyAKQJGZNlAEmBSIyzCRpAyNlEGUBSOiDV2VgNIMXZOA0gOylTbABd"
+        "MhPNDAAA90noxK50xhIAAAAASUVORK5CYII="
+    ),
+    "stairs_down_mine": (
+        "iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAAWUlEQVR42mNICrD6TwlmABEF"
+        "QRZkYRQDTpw4QRLGMKAny4NojNUFNloyJGGKvIDVBaQ4H6sL6OIFmNOxGkCK8+nvBWSn4zSA"
+        "WKfjNEBAQIAkjGEARZmJEgwAohoVfesLWmkAAAAASUVORK5CYII="
+    ),
+    "dwall_lava": (
+        "iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAASUlEQVR42mPw01H7jwsrCQn8"
+        "z7MxwCvPAGKAFKFjmAJC8tQxAJ8TCckzgAhKMAOpgYYuz0Cqn9HlKTeA1EBDF6NuII6mxAFK"
+        "iQC3RZNs3lE6egAAAABJRU5ErkJggg=="
+    ),
+    "dfloor_lava": (
+        "iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAAUklEQVR42mNwsrH6TwlmABFh"
+        "fl6UGUAMVhISIN8AXJqxGkCsd2DqGKgSiPicSHQg4jMEn7eo4wVSMbJryY4FolxATOAyUJKI"
+        "SA4DbN6jX2bChQEVqbVeGfCggAAAAABJRU5ErkJggg=="
+    ),
+    "chest_lava": (
+        "iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAAVElEQVR42mNwsrH6TwlmGFwG"
+        "RFlIEYWxGgCS2NHgQRRGNoSBVM3ohsANWNEmTxLGMKA7ShsDwxRjkyNoAEijgIAAGGMzhPYu"
+        "IISpH4jk4EGYF8jBAOHu5IZcG8wSAAAAAElFTkSuQmCC"
+    ),
+    "stairs_up_lava": (
+        "iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAATUlEQVR42mNwsrH6TwlmIFZh"
+        "d5T2/ygLKTobANKEjMkyAKQJGZNlAEmBSIyzCRpAyNlEGUBSOiDV2VgNIMXZOA0gOylTbABd"
+        "MhPNDAAA07u9TMB2mEIAAAAASUVORK5CYII="
+    ),
+    "stairs_down_lava": (
+        "iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAAWUlEQVR42mNwsrH6TwlmABF+"
+        "OmpkYRQDTpw4QRLGMCDPxoBojNUFSkICJGGKvIDVBaQ4H6sL6OIFmNOxGkCK8+nvBWSn4zSA"
+        "WKfjNEBAQIAkjGEARZmJEgwADBfZ9t5ifxIAAAAASUVORK5CYII="
+    ),
+    "dwall_lair": (
+        "iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAASUlEQVR42mNIcGj4jwtriFn8"
+        "b4hZgFeeAcQAKULHMAWE5KljAD4nEpJnABGUYAZSAw1dnoFUP6PLU24AqYGGLkbdQBxNiQOU"
+        "EgG78gWzgCK+jQAAAABJRU5ErkJggg=="
+    ),
+    "dfloor_lair": (
+        "iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAAUklEQVR42mOw0HD6TwlmABEe"
+        "ZiGUGUAM1hCzIN8AXJqxGkCsd2DqGKgSiPicSHQg4jMEn7eo4wVSMbJryY4FolxATOAyUJKI"
+        "SA4DbN6jX2bChQEheqEs9I4BSwAAAABJRU5ErkJggg=="
+    ),
+    "chest_lair": (
+        "iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAAVElEQVR42mOw0HD6TwlmGFwG"
+        "RFlIEYWxGgCS2NHgQRRGNoSBVM3ohsANWNEmTxLGMKA7ShsDwxRjkyNoAEijgIAAGGMzhPYu"
+        "IISpH4jk4EGYF8jBAPtM2gpxrhcYAAAAAElFTkSuQmCC"
+    ),
+    "stairs_up_lair": (
+        "iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAATUlEQVR42mOw0HD6TwlmIFZh"
+        "d5T2/ygLKTobANKEjMkyAKQJGZNlAEmBSIyzCRpAyNlEGUBSOiDV2VgNIMXZOA0gOylTbABd"
+        "MhPNDAAAXoWq6JyuL80AAAAASUVORK5CYII="
+    ),
+    "stairs_down_lair": (
+        "iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAAWUlEQVR42mOw0HD6TwlmABEJ"
+        "Dg1kYRQDTpw4QRLGMKAhZgHRGKsLNMQsSMIUeQGrC0hxPlYX0MULMKdjNYAU59PfC8hOx2kA"
+        "sU7HaYCAgABJGMMAijITJRgAlDoT9eqeuVUAAAAASUVORK5CYII="
+    ),
+    "water@1": (
+        "iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAAR0lEQVR42mPQiNr3nxLMQFMD"
+        "8pZ+AGOyDEDWiM8QhgELA5j3GAj5kZD3GAZ3NBITlQzE+hWXIdTxAjEpDqcB6M4k1aCBj0YA"
+        "NYdMEjoqSLcAAAAASUVORK5CYII="
+    ),
+    "deep@1": (
+        "iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAASUlEQVR42mOQMGj4TwlmoKkB"
+        "GlH74JhkA9A14TKEci8QciIhLzIQciIhLzIM7mgkJjoZiPUrLv4gCgNkf5ISpQy40gCxhlDs"
+        "BQAI3NDoDoE82wAAAABJRU5ErkJggg=="
+    ),
+    "fountain@1": (
+        "iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAAlUlEQVR42mN4dK7n/5F1GWAM"
+        "YsMwNj42MQZ0wRMnTuDFeA0AKejq6sKLYYbAXMQA48A0a0Ttw4uRDQFhBnTbkRWDANkGgEDe"
+        "0g8YhmAYAPMLOS6AhwEuL4BcgMsAWOBTxwu4XIDNO0QZgM3v2LxAMAxISgfIMUFMSkQxADmj"
+        "kJIXUMIAV45DFscmx4AugK4BV7aGiQMAGFbl1GJueNwAAAAASUVORK5CYII="
+    ),
+    "lava@1": (
+        "iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAAh0lEQVR42o2TQQqAMAwE9xEe"
+        "xbNnP+GXiv8TfIn4C6WFSiibbA45yKw1mVQc8/Re29rqOfdW/bkyxu+y/BwM1rIHdW5Z52Av"
+        "j6HoA6kOojGRcWAzI4MKqMPhBUaB3nhQASU4JTHsQM0pHSiJioHJYh14oqGuqsfDLWQ34W6B"
+        "3Qf3X2CSlETLP9cKVYGinG7PAAAAAElFTkSuQmCC"
+    ),
+    "torch@1": (
+        "iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAAf0lEQVR42mOIiIj4jwtraaj9"
+        "7+rqwivPAGKAFKFjmAJC8ngNeFYhR5wB2PCLo+5gA2CG4PQCiMCGYQaAaFxqMFyAHmjohmAL"
+        "UAZcgRZlIYWCcQUqA75Qh2nGFysYXkDmI9uOTR7sBXwBRAxmGNwpkWgD8DmRkDx1A5GYQEOX"
+        "BwCT9gd38Lp6UgAAAABJRU5ErkJggg=="
+    ),
+    "avatar@1": (
+        "iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAAf0lEQVR42mNgwAGiLKT+I2MG"
+        "UgC6ZpINASn+cGACCkY34MSJE7gNBGkQEBCAa4axSTIAGybaAJghJ4w0wBhdM14DNKL2/ceH"
+        "8RpASDMMg1y0ok3+P1ZnIyt8cdQdjNFdgFUzzAB8LiE6HVBsAMUpEd1Gsr1AlgHYnEx2riQG"
+        "AAB5EOpbbqktEgAAAABJRU5ErkJggg=="
+    ),
+    "lord@1": (
+        "iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAAb0lEQVR42mNgoDZ4cdT9PzKN"
+        "SwyvAfgwUQZUyYhgaISJETTgw4EJ//FhogwQEBDA0AgTo70L/iMBmCZkQFRU/scBCGo8YaTx"
+        "HxnDALo4UZoJYayBR6wLsAYmsgG4AF4D0L2BSzPOMKA4EEkJSGQ9AOHOfIJJhfOKAAAAAElF"
+        "TkSuQmCC"
+    ),
+    "guard@1": (
+        "iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAAe0lEQVR42mNgoCXojtL+D8IU"
+        "aSbJEHRNuDBRhn04MOE/MibZCwICAnDNIDbJBlDsAmRDsMl1dXVhN/SEkcZ/fBivAeiKXxx1"
+        "B2NshmA1AORcQi6AeQunAfi8QVQYwKIQhEHOh7HRoxKvARIGDWDNIBqZTV8DkDWg85EBANNF"
+        "2+ljrf3ZAAAAAElFTkSuQmCC"
+    ),
+    "man@1": (
+        "iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAAZUlEQVR42mNgwAGiLKT+I2MG"
+        "UgC6ZpINASn+cGACCibJAJAGAQEBuGYYmyQDsGGSwoFszVb9Vv/xYYo0EzQE5FRCmvF6ByaJ"
+        "z2aiwqM7Svs/NkxxQJKclHHxaWsAKNnCMD4xqgEAm2TK5ehDGigAAAAASUVORK5CYII="
+    ),
+    "woman@1": (
+        "iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAAaklEQVR42mNgwAFeHHX/j4wZ"
+        "SAHomkk2BKT4w4EJKJhoA2CaBQQE4JphbKIMwWY7Sa6AKULXjCxHEOQ5rPqPDVOkmShDQE4l"
+        "ZADMOzgNIOQFvAZQ7AVCmgkaQpEBxGomyiugpAvCuPhUBQB7WyLGWN/HeQAAAABJRU5ErkJg"
+        "gg=="
+    ),
+    "merchant@1": (
+        "iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAAZUlEQVR42mNgwAE+HJjwHxkz"
+        "kALQNZNsCEixgIAAXCOMTV8XRFlIoWCSwwHdAKI17mjw+I8PE6UZFyBoCMifhADesIBJ4tKM"
+        "rAYvwGcAUYBiAyIiIv6DMC4+bQ0ApXsYxidGNQAAzrUY8hUzq3AAAAAASUVORK5CYII="
+    ),
+    "jester@1": (
+        "iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAAdUlEQVR42mNgoCZ4cdT9P0Vq"
+        "Thhp/AdhXPJ5Dqv+gzBeG2CGIBsE00hQMzZDQJgkzSDw4cCE/9gwSQYICAjANcLYJBmA7g2S"
+        "DMDmDaI14gpAkqMQlwF4DcHmd3TNeL0Dk8RlALIavABZE7aUSbQBxOYRigwAAJNk3Aeg3r47"
+        "AAAAAElFTkSuQmCC"
+    ),
+    "wizard@1": (
+        "iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAAb0lEQVR42mNgoCXQiNr3nyLN"
+        "L466/yfLEJAmdEy2RrIM+nBgwn90jCyft/QDfoMEBATgGpHZyAbgNeQ/FoAs3x2lTdgruDQT"
+        "NICYAMRpADGxAMI4DQAFFEwRLBGR5AKaeAHdJRSHAU4DiA1A9EAEAA/FD58NFUaMAAAAAElF"
+        "TkSuQmCC"
+    ),
+    "canoe@1": (
+        "iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAAY0lEQVR42mNgGLQgykLqPzKm"
+        "SDPJhoAUfzgwAQWTZABIg4CAAFwzjE2SN9BdgC7fHaWN3UCNqH3/8WG8mkE2ETIApIYiAzA0"
+        "72jw+I8r2ghhkF64ISCTScFwzcguIQUzDB8AABky3TbSiR3xAAAAAElFTkSuQmCC"
+    ),
+    "goose@1": (
+        "iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAAXUlEQVR42mNgoBYQEBD4D8Jk"
+        "awYBsg1BN4BsQyjyBsXhQFUDIiIisGK8mnFpItogkMSJEyfAGFkxOh+GsXoV2RBshiFrxhlW"
+        "ZHsBHTyrkPuPj09bA0CKkTWg86kKAAt8nyybvBOJAAAAAElFTkSuQmCC"
+    ),
+    "beaver@1": (
+        "iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAASklEQVR42mNgGAVYQXeU9n9k"
+        "TJFmkgwBKRQQEPhPliFRFlI4NRJlyH8ooMgQYjRTxRCQd2GYZAOQNeM1AJ0NC2i8mpEVobMH"
+        "LwAAUqmtxQJayM0AAAAASUVORK5CYII="
+    ),
+    "rat@1": (
+        "iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAAQklEQVR42mNgGAWDEJw4ceI/"
+        "CJOtuaurCyfGq1lAQACvZrwGEasRqyEveqb9p8gAclwAsxiEsXoHmcYlBjNkGCQ8AGFFsYiu"
+        "jsDzAAAAAElFTkSuQmCC"
+    ),
+    "bat@1": (
+        "iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAATUlEQVR42mNgGJTATintPzFi"
+        "cAl0SXQxvGpgDGwa0DE2eZyKTxhpYGVjGIpLgliM18kwQMhLeA0hSjNyNBGjEWeU4jKMKE3E"
+        "ppFRgAkAAJ2vB5rP0YgAAAAASUVORK5CYII="
+    ),
+    "snake@1": (
+        "iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAAWUlEQVR42mNgGBnAqt/qPzKm"
+        "SDPJhoAUCwgIwDXC2PRzAa4wOGGk8Z/ogMImjmIASEIlRQMFIyvG63SYZmz+xCaO1wBChuMN"
+        "JEKuICqk0cOBaM344pzm+QQAgsOiZDTxgHwAAAAASUVORK5CYII="
+    ),
+    "slime@1": (
+        "iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAAUUlEQVR42mNgGAV4Qd6+gP8g"
+        "TJFmkg1B10iSQSAFMECyQTDNhDTiNAQmKCAgAMboirGJY/U3KQbADSHF2VgNsOq3IlkjSA9K"
+        "GIAESMGDJ7kDAGcX/O9HCWaeAAAAAElFTkSuQmCC"
+    ),
+    "wolf@1": (
+        "iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAARElEQVR42mNgGD6gq6vrPzJN"
+        "lgEwTLZmAQGB/yQbhKyBWIxhyIkTJ/5TbBA5mikyBG94oLMJyVHPAFA0gjA6m5DcEAcAxTPU"
+        "m2MlJJIAAAAASUVORK5CYII="
+    ),
+    "goblin@1": (
+        "iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAAbElEQVR42mNgGDQgb1/Af4rU"
+        "ggRhGJ2PTQyv6fgwUc47YaSBoREmRpQBFLkAZoiAgAAKJiWQGXAFIjI4ceIEdgOjLKT+48N4"
+        "DQDZRMgAmGtwGoDPFejew+l/dA3ofKIDkGgbkQFy1OEToxoAAOXPvweJHyDgAAAAAElFTkSu"
+        "QmCC"
+    ),
+    "orc@1": (
+        "iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAAb0lEQVR42mNgoAVQSdH4jw1T"
+        "pJloQ0CKThhhaoSJ0ccFIICuESZGu0Ds6ur6HxERQRQGqcWwkVjNMIziIpgTSdGM1QAQm5Bm"
+        "ZPVwryAbEGUh9R8fxmoAMiDGABDojtImbAA+MZABBNMAPjGKDYABAGNOBHCZqxL+AAAAAElF"
+        "TkSuQmCC"
+    ),
+    "skeleton@1": (
+        "iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAASklEQVR42mNgoBU4ceLEf2RM"
+        "kWaSDREQEPgPwjCNMD79XAAzBNklFAUkVQKQKMOQFeDSiNcQmCQ+24kygGwXUD0lkh0b2BQP"
+        "XgMAhfvc27ijIlYAAAAASUVORK5CYII="
+    ),
+    "spider@1": (
+        "iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAAW0lEQVR42mNgGBRAQEDgPzY2"
+        "SeoIGUKUJeiKkDExLsSqEZdBBDWdMNLAysYwDN1UUlyANSCRcZWMCBgT7Q10g9ANICkKsdmK"
+        "0xBsCpANwWYZ1kAkGMdkqB8CAAAKsmTbLuwhJAAAAABJRU5ErkJggg=="
+    ),
+    "troll@1": (
+        "iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAAYklEQVR42mNgoDZo6PH4jw1T"
+        "pBmbId1R2v+xGnDCSANDI7IYsgEYhhDrAphmnAagA6JsJzYQQWySnY43QCnSjGwAsYbh9DOI"
+        "HWUh9Z8Qpr4ByACbYpIMwOZfkvIELoU0NQAAb7M85ut1yfUAAAAASUVORK5CYII="
+    ),
+    "ghost@1": (
+        "iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAAQUlEQVR42mNgwAJOnDjxHxtm"
+        "IAbg0kyUIYQ0EzQEpkBAQACMcfFpbwDFXsBlM/0NoNgLQ9gAdMOw8XEaQAp/cAAAUNeHqw9S"
+        "0b8AAAAASUVORK5CYII="
+    ),
+    "daemon@1": (
+        "iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAAfElEQVR42mNgoBY4ceLEf4rU"
+        "ogueMNL4j4yJsgwmga4Z2RCCLoUpfnHU/X+VjAgYg9ggjM01eA3B5w04gNmCbgA6QDcArg/G"
+        "gBmCy3ZkV6DoQeYQ0gzD1DUAPRxI8QJJMUB0FCIbgotPFQPwGkjIALyaBQQE/sMwNjF0zQAx"
+        "vw7q8ajAgAAAAABJRU5ErkJggg=="
+    ),
+    "dragon@1": (
+        "iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAAcUlEQVR42mNgoBeokhH5D8IU"
+        "aSbLEJimF0fd4QY8q5D7T7btMANQDMHlLGyaYXIYBqAbQpK/0RWeMNL4D8L4XIDXqTADcBmE"
+        "1xB0zSQbgssAdEPwhgdFBmALVHxiJKV7ZHGcmgUEBP7DMC5xsjMVNgAA3ZW9aZEgcJcAAAAA"
+        "SUVORK5CYII="
+    ),
+    "serpent@1": (
+        "iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAAR0lEQVR42mNgoBew6rf6D8MU"
+        "aSbLIJBiAQGB/2S7gmybcfn9hJHGf+oHHDbFRBsAU6SSooGiAVmMoGZiDMRpANUTziggDQAA"
+        "AFxiuCXXjMUAAAAASUVORK5CYII="
+    ),
+    "witch@1": (
+        "iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAAYklEQVR42mNgoCWwU0r7T5Fm"
+        "GKZIM0mGYNNIlkF5+wL+o2Nkeat+K/wGCQgIwDUis5ENwGsIIRd0R2n/J8kb6HJ4DVBJ0fiP"
+        "CxM0AJ9mZIzTAJBzKXIBXbxAOwOIDUD0QAQAaZvMcPps6/MAAAAASUVORK5CYII="
+    ),
+    "moosedain@1": (
+        "iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAAc0lEQVR42mNgoBR0R2n/B2Fc"
+        "fKLUwTi4NKNrwqqOkCHEWgJXGGUhhYIJakQH6AaQFLAgDSeMNOCaYWyybSfbFbg0vzjq/p8o"
+        "AwQEBMAY3YAVbfK4DchzWPUfH4bFFFmaYRinASCnUuQCmF/xacZrwICEAQAP+/I6DVYrGAAA"
+        "AABJRU5ErkJggg=="
     ),
 }
 # ── TILE DATA END

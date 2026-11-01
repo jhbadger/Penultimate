@@ -41,7 +41,26 @@ PALETTE = {
     "t": (230, 120, 30),
     "d": (58, 50, 44), "D": (78, 68, 58),
     "p": (232, 140, 150),
+    # dungeon themes: ice, mine, lava and Moosedain's lair
+    "i": (186, 222, 240), "I": (120, 170, 210), "j": (62, 100, 140),
+    "x": (206, 228, 242), "X": (178, 206, 226),
+    "h": (112, 82, 56), "H": (140, 106, 72), "J": (60, 42, 28),
+    "v": (118, 98, 72), "V": (98, 80, 58),
+    "1": (78, 44, 38), "2": (110, 60, 48), "0": (34, 18, 16),
+    "3": (66, 60, 58), "4": (86, 78, 74),
+    "5": (96, 64, 128), "6": (128, 92, 160), "7": (40, 22, 56),
+    "8": (56, 40, 66), "9": (72, 54, 84),
 }
+
+# Each dungeon theme recolours the stone dungeon's walls, floor, stairs and
+# chests: wall S/s/K and floor d/D become the theme's colours.
+THEMES = {
+    "ice": {"S": "I", "s": "i", "K": "j", "d": "X", "D": "x"},
+    "mine": {"S": "h", "s": "H", "K": "J", "d": "V", "D": "v"},
+    "lava": {"S": "1", "s": "2", "K": "0", "d": "3", "D": "4"},
+    "lair": {"S": "5", "s": "6", "K": "7", "d": "8", "D": "9"},
+}
+THEMED = ("dwall", "dfloor", "chest", "stairs_up", "stairs_down")
 
 TILES = {}
 
@@ -679,6 +698,139 @@ dddddddddddddddd
 dddddddddddddddd
 """)
 
+tile("torch", """
+SSSSSSSKsSSSSSSK
+SsssssSKSsssssSK
+SsssssSeSsssssSK
+SSSSSSteeSSSSSSK
+KKKKKKtetKKKKKKK
+SSSKsSStetKsSSSS
+ssSKSsNNNNSKSsss
+ssSKSssNNsSKSsss
+SSSKSSSNNSSKSSSS
+KKKKKKKKKKKKKKKK
+SSSSSSSKsSSSSSSK
+SsssssSKSsssssSK
+SsssssSKSsssssSK
+SSSSSSSKSSSSSSSK
+KKKKKKKKKKKKKKKK
+SSSKsSSSSSSKsSSS
+""")
+
+tile("lava", """
+RrrttrrRRrrtterR
+rrtteetrrrteettr
+rtteeettrrtteetr
+rrtteetrrRrrttrr
+RrrttrrRRRrrrrRR
+RRrrrrRRrrttrrRR
+rrttrrrrrtteetrr
+rtteetrrtteeettr
+rrtteetrrtteetrr
+RrrttrrRrrttrrRR
+RRrrrrRRRrrrrRRR
+rrrttrrRrrrttrrr
+rrteettrrrteetrr
+rtteeetrrtteeetr
+rrttetrrrrtteetr
+RrrrrrRRRrrrrrRR
+""")
+
+tile("slick", """
+WWWWWWWWWWWWWWWW
+WccWWWWWWWWWWWWW
+WWccWWWWWiWWWWWW
+WWWccWWWWWWWWWWW
+WWWWWWWWWWWWcWWW
+WWWWWWWWWWWccWWW
+WiWWWWWWWWccWWWW
+WWWWWWWWWWWWWWWW
+WWWWWcWWWWWWWWWW
+WWWWccWWWWWWWiWW
+WWWccWWWWWWWWWWW
+WWWWWWWWWWWWWWWW
+WWWWWWWWWWccWWWW
+WWiWWWWWWWWccWWW
+WWWWWWWWWWWWccWW
+WWWWWWWWWWWWWWWW
+""")
+
+tile("pool", """
+VvvvVvvvvVvvvvVv
+vvVBBBBBBBBBvvVv
+vVBBBBcBBBBBBvvv
+vBBBBBBBBBBBBBvV
+vBBcBBBBBBBcBBBv
+VBBBBBBBBBBBBBBv
+vBBBBBBBcBBBBBBv
+vBBBBBBBBBBBBBBV
+VBBBBcBBBBBBBBBv
+vBBBBBBBBBBBcBBv
+vBBBBBBBBBBBBBBv
+vVBBBBBBcBBBBBvv
+vvBBBBBBBBBBBBVv
+vvvVBBBBBBBBBvvv
+VvvvvvVvvvvvvVvv
+vvVvvvvvvvVvvvvV
+""")
+
+tile("gate", """
+KKKKKKKKKKKKKKKK
+KwKKwKKwKKwKKwKK
+KwKKwKKwKKwKKwKK
+KwKKwKKwKKwKKwKK
+wwwwwwwwwwwwwwww
+KsKKsKKsKKsKKsKK
+KwKKwKKwKKwKKwKK
+KwKKwKKwKKwKKwKK
+KwKKwKKwKKwKKwKK
+KwKKwKKwKKwKKwKK
+KsKKsKKsKKsKKsKK
+wwwwwwwwwwwwwwww
+KwKKwKKwKKwKKwKK
+KwKKwKKwKKwKKwKK
+KsKKsKKsKKsKKsKK
+KKKKKKKKKKKKKKKK
+""")
+
+tile("key", """
+................
+................
+................
+................
+................
+....eee.........
+...e...eeeeeeee.
+...e...E....e.e.
+....eee.........
+................
+................
+................
+................
+................
+................
+................
+""")
+
+tile("trap", """
+................
+................
+................
+................
+....kkkkkkkk....
+...kKwKKKwKKk...
+..kKKKKwKKKKKk..
+..kKwKKKKKwKKk..
+..kKKKKwKKKKKk..
+..kKKwKKKwKKKk..
+...kKKKKKKKKk...
+....kkkkkkkk....
+................
+................
+................
+................
+""")
+
 # ── People ───────────────────────────────────────────────────────────────────
 
 tile("avatar", """
@@ -1273,6 +1425,32 @@ tile("bolt", """
 ................
 ................
 """)
+
+
+# ── Generated tiles ──────────────────────────────────────────────────────────
+
+for theme, recolour in THEMES.items():
+    for base in THEMED:
+        TILES["%s_%s" % (base, theme)] = [
+            "".join(recolour.get(ch, ch) for ch in row) for row in TILES[base]]
+
+# Second animation frames, "<name>@1": waves roll, flames flicker, and
+# creatures bob up and down a pixel.
+for name in ("water", "deep"):
+    TILES[name + "@1"] = [row[-4:] + row[:-4] for row in TILES[name]]
+for name, (a, b) in (("fountain", "cW"), ("lava", "te"), ("torch", "et")):
+    TILES[name + "@1"] = ["".join(b if ch == a else a if ch == b else ch
+                                  for ch in row) for row in TILES[name]]
+BOBBING = ["avatar", "lord", "guard", "man", "woman", "merchant", "jester",
+           "wizard", "canoe", "goose", "beaver", "rat", "bat", "snake",
+           "slime", "wolf", "goblin", "orc", "skeleton", "spider", "troll",
+           "ghost", "daemon", "dragon", "serpent", "witch", "moosedain"]
+for name in BOBBING:
+    rows = TILES[name]
+    if rows[0].strip("."):              # something in the top row: bob down
+        TILES[name + "@1"] = ["." * 16] + rows[:-1]
+    else:
+        TILES[name + "@1"] = rows[1:] + ["." * 16]
 
 
 # ── PNG output ───────────────────────────────────────────────────────────────

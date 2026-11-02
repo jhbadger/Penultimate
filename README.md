@@ -23,7 +23,8 @@ same.
 
 You need Python 3 with Tk (on macOS with Homebrew: `brew install
 python-tk`). Sound effects and music play through `afplay` (macOS),
-`paplay` or `aplay`. If none of them is available, the game is silent.
+`paplay` or `aplay`, or through pygame's mixer if it is installed. If none
+of them is available, the game is silent.
 
 To build a macOS app with an icon:
 
@@ -61,8 +62,9 @@ sound, music, new game and quit.
 
 **Android:** install [Pydroid 3](https://play.google.com/store/apps/details?id=ru.iiec.pydroid3),
 open `penultimate` in it and run it. Tiles are scaled up for phone screens,
-and the on-screen keyboard only appears if you tap the box to type. There
-is no sound on Android.
+and the on-screen keyboard only appears if you tap the box to type. For
+sound, install `pyjnius` from Pydroid's pip menu (the game then plays
+through Android's own media player); `pygame` works too, as a fallback.
 
 **Gamepad (Linux, including the Steam Deck):** the game reads the
 joystick device directly, so an Xbox-style pad works with nothing to

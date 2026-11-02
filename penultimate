@@ -60,7 +60,8 @@ Keys:  arrows / WASD   move (into monsters to fight, into people to talk)
 
 Sound effects and chiptune music (a tune each for the wilderness, towns,
 the castle and dungeons) are synthesized and played with afplay (macOS),
-paplay or aplay if one is available; otherwise the game is silent.  The
+paplay or aplay if one is available, on Android with pyjnius, or with
+pygame's mixer; otherwise the game is silent.  The
 music is rendered once and cached in ~/.cache/penultimate.
 
 App bundle (macOS):  penultimate --build-app [DIR]   builds penultimate.app
@@ -1407,6 +1408,130 @@ def render_tune(tune):
     return [v * MUSIC_VOLUME for v in buf]
 
 
+# Players.  Each starts a WAV file and returns a handle that, like a
+# subprocess, has poll() (None while it plays) and terminate().  On the
+# desktop that is a command-line player; Android has none, so there the game
+# uses Android's MediaPlayer through pyjnius, or failing that SDL's mixer.
+
+class CommandPlayer:
+    def __init__(self, cmd):
+        self.cmd = cmd
+
+    def start(self, path):
+        return subprocess.Popen(self.cmd + [path], stdout=subprocess.DEVNULL,
+                                stderr=subprocess.DEVNULL)
+
+    @classmethod
+    def find(cls):
+        for cmd in (["afplay"], ["paplay"], ["aplay", "-q"]):
+            if shutil.which(cmd[0]):
+                return cls(cmd)
+
+
+class MediaPlayer:
+    """Android's android.media.MediaPlayer, reached through pyjnius (pip
+    install pyjnius in Pydroid)."""
+
+    class Handle:
+        def __init__(self, mp):
+            self.mp = mp
+
+        def poll(self):
+            if self.mp is None:
+                return 0
+            try:
+                if self.mp.isPlaying():
+                    return None
+            except Exception:
+                pass
+            self.terminate()
+            return 0
+
+        def terminate(self):
+            if self.mp is not None:
+                try:
+                    self.mp.stop()
+                except Exception:
+                    pass
+                self.mp.release()
+                self.mp = None
+
+    def __init__(self, cls):
+        self.cls = cls
+
+    def start(self, path):
+        mp = self.cls()
+        try:
+            mp.setDataSource(path)
+            mp.prepare()
+            mp.start()
+        except Exception as e:
+            mp.release()
+            raise OSError(str(e))
+        return self.Handle(mp)
+
+    @classmethod
+    def find(cls):
+        try:
+            import importlib
+            jnius = importlib.import_module("jnius")
+            return cls(jnius.autoclass("android.media.MediaPlayer"))
+        except Exception:
+            return None
+
+
+class MixerPlayer:
+    """SDL's mixer, through pygame.  Pydroid chooses how to run a script
+    from the modules it imports, so the module's name is put together at
+    run time: a Tk game must not be started as an SDL one."""
+
+    class Handle:
+        def __init__(self, channel, snd):
+            self.channel, self.snd = channel, snd
+
+        def poll(self):
+            ch = self.channel
+            if ch and ch.get_busy() and ch.get_sound() is self.snd:
+                return None
+            return 0
+
+        def terminate(self):
+            if self.poll() is None:
+                self.channel.stop()
+
+    def __init__(self, mixer):
+        self.mixer = mixer
+        self.sounds = {}
+
+    def start(self, path):
+        snd = self.sounds.get(path)
+        if snd is None:
+            try:
+                snd = self.sounds[path] = self.mixer.Sound(path)
+            except Exception as e:
+                raise OSError(str(e))
+        return self.Handle(snd.play(), snd)
+
+    @classmethod
+    def find(cls):
+        try:
+            import importlib
+            os.environ.setdefault("PYGAME_HIDE_SUPPORT_PROMPT", "1")
+            mixer = importlib.import_module("py" + "game.mixer")
+            mixer.init(RATE, -16, 1, 512)
+            mixer.set_num_channels(8)
+            return cls(mixer)
+        except Exception:
+            return None
+
+
+def find_player():
+    player = CommandPlayer.find()
+    if not player and ANDROID:
+        player = MediaPlayer.find()
+    return player or MixerPlayer.find()
+
+
 class Sound:
     def __init__(self):
         self.muted = False
@@ -1415,11 +1540,7 @@ class Sound:
         self.music_proc = None
         self.music_playing = None
         self.music_deadline = 0     # when the playing loop should be over
-        self.player = None
-        for cmd in (["afplay"], ["paplay"], ["aplay", "-q"]):
-            if shutil.which(cmd[0]):
-                self.player = cmd
-                break
+        self.player = find_player()
         self.files = {}
         self.tunes = {}
         self.lengths = {}           # tune file: seconds
@@ -1586,9 +1707,7 @@ class Sound:
             self.stop_music()
         if want:
             try:
-                self.music_proc = subprocess.Popen(
-                    self.player + [want], stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL)
+                self.music_proc = self.player.start(want)
                 self.music_playing = want
                 self.music_deadline = (time.monotonic() +
                                        self.lengths.get(want, 60) + 5)
@@ -1610,9 +1729,7 @@ class Sound:
         if len(self.procs) >= 4:
             return
         try:
-            self.procs.append(subprocess.Popen(
-                self.player + [path], stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL))
+            self.procs.append(self.player.start(path))
         except OSError:
             pass
 

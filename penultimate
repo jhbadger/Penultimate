@@ -601,6 +601,19 @@ def place_inukshuks(world):
         grid[y][x] = "inukshuk"
 
 
+def build_world(seed):
+    """A whole world: the land, its islands and inukshuks, its errands, and
+    a theme for each dungeon."""
+    world = generate_world(seed)
+    place_inukshuks(world)
+    make_side_quests(world)
+    themes = ["stone", "stone", "ice", "mine", "lava"]
+    random.Random("%s:themes" % seed).shuffle(themes)
+    for d, theme in zip(world["dungeons"], themes + ["lair"]):
+        d["theme"] = theme
+    return world
+
+
 # ── Side quests ──────────────────────────────────────────────────────────────
 #
 # Two errands per town, chosen from the seed like everything else: slay
@@ -724,6 +737,62 @@ def errand_text(world, q):
                 q["item"], q["to"], SHOP_TITLES[q["to_shop"]], t["name"],
                 where(here, (t["x"], t["y"])), q["to"], q["gold"]))
 
+
+# ── The MIM Blueberry ──
+#
+# Magic im Motion of Waterloo makes the Blueberry, the enchanted message
+# slate every hero in the realm carries: a to-do list, thy particulars,
+# and messages from His Lordship (who is always sorry to bother thee).
+
+BBM = {
+    "start": "Sorry to bother thee. When thou hast a moment, come to the "
+             "castle and ask me about thy QUEST? No rush. Well, a little "
+             "rush. Sorry.",
+    "relic": "Sorry to message again. Any luck with %s? I don't mean to "
+             "hover. I'm hovering. Sorry.",
+    "held": "Thou HAST it? Wonderful! Bring %s home when thou canst. Sorry "
+            "for all the exclamation marks!",
+    "final": "The Maple Blade suits thee. Moosedain's lair lies %s. Mind "
+             "the lava. Sorry about the lava.",
+    "dead": "Is it true? Moosedain is no more? Come home! There will be "
+            "pancakes! Sorry, I'm very excited.",
+    "won": "Thank thee again. And sorry. For everything. Mostly the geese.",
+    "beaver": "I hear thou art a beaver. Come to the castle and I'll set "
+              "thee right. Sorry, I've no idea how thou'rt reading this.",
+}
+
+# The royal honours, from what thou didst: (tally, how many count, title).
+# "%d" is the count; the best few are read out at the feast.
+HONOURS = (
+    ("kills", 200, "Scourge of the Wilderness (%d foes)"),
+    ("errands", 4, "Errand-Runner of the Realm (%d errands)"),
+    ("geese", 2, "Royal Goosewrangler (%d geese)"),
+    ("sorry", 3, "Most Apologetic (said sorry %d times)"),
+    ("beaver", 1, "Friend to Beavers (was one %d time%s)"),
+    ("inukshuks", 3, "Seeker of Inukshuks (%d visited)"),
+    ("pucks", 25, "Puckslinger Supreme (%d pucks slung)"),
+    ("spells", 25, "Archmage of the Frozen North (%d spells cast)"),
+    ("donuts", 3, "Lord of the Donuts (%d foes donutified)"),
+    ("deaths", 1, "Died and Lived to Tell (%d time%s)"),
+    ("potions", 15, "Connoisseur of Potions (%d drunk)"),
+    ("paddled", 300, "Voyageur of the Seven Lakes (%d squares paddled)"),
+)
+# What became of the towns, after.
+TOWN_AFTER = (
+    "%s named its curling rink after thee",
+    "%s holds a pancake breakfast in thy honour, every year",
+    "%s put up a statue of thee. The geese use it",
+    "%s's tavern serves a poutine named after thee. It is enormous",
+    "%s painted thy face on the side of the grain elevator",
+    "%s made thee an honorary member of the volunteer fire brigade",
+)
+CLIFFHANGERS = (
+    "Deep in the lair, where the ice is melting, a single antler twitches.",
+    "Far to the south, a moose of unusual size crosses the border. It "
+    "looks sorry. It is not.",
+    "On the castle steps the next morning, a letter: 'Thou hast not seen "
+    "the last of me. -M.' It is very rude, and spelled wrong.",
+)
 
 # ── Maps and creatures ───────────────────────────────────────────────────────
 
@@ -1185,8 +1254,12 @@ def furnish(world, area, d, di, level, rooms, centers):
             g[y][x] = "gate"
         inside = {(x, y) for x in range(rx, rx + rw)
                   for y in range(ry, ry + rh)}
+        # only where thou canst get to without going through the gates: a
+        # room beyond the locked one is behind them too
+        open_ = reach(area, up, DUNGEON_FLOOR | {"chest"})
         spots = [(x, y) for y in range(H) for x in range(W)
                  if g[y][x] == "dfloor" and (x, y) not in inside
+                 and (x, y) in open_
                  and abs(x - up[0]) + abs(y - up[1]) >= 4]
         if spots:
             area.items[rng.choice(spots)] = "key"
@@ -1891,6 +1964,8 @@ C + number          cast a spell (aimed ones then
 P                   drink a healing potion
 M                   map of the lands you have seen
 J                   journal: your quest and errands
+L                   thy MIM Blueberry: a to-do list, and
+                    thy particulars
 + / -               zoom in / out (the Menu also has bigger
                     and smaller text)
 V                   sound effects on / off
@@ -1915,7 +1990,7 @@ open. A night at the inn takes you to the morning.
 
 Gamepad (Linux, Steam Deck): d-pad or stick moves,
 A waits or chooses, B backs out, X sling, Y cast,
-LB potion, RB journal, View map, Start menu.
+LB potion, RB Blueberry, View map, Start menu.
 
 Press any key to close."""
 
@@ -1961,7 +2036,7 @@ class Game:
                                 ("cast", "Cast", self.choose_spell),
                                 ("potion", "Potion", self.drink),
                                 ("map", "Map", self.toggle_map),
-                                ("journal", "Journal", self.journal),
+                                ("phone", "Blueberry", self.blueberry),
                                 ("menu", "Menu", self.action_menu)):
             b = tk.Button(bar, text=label, command=cmd, width=7,
                           highlightbackground=PANEL, takefocus=0)
@@ -2101,7 +2176,7 @@ class Game:
 
     def pad_button(self, name):
         """A: choose, or wait a turn. B: back. X: sling. Y: cast.
-        LB: potion. RB: journal. View: map. Start: the menu."""
+        LB: potion. RB: the Blueberry. View: map. Start: the menu."""
         self.walking = None
         if self.busy:
             return
@@ -2114,6 +2189,8 @@ class Game:
         if self.talk:
             return
         if self.overlay:
+            if name == "a" and self.next_page():
+                return
             if self.overlay == "won" or name == "start":
                 self.action_menu()
             else:
@@ -2196,13 +2273,7 @@ class Game:
     # ── Game setup ──
 
     def setup_world(self, seed):
-        self.world = generate_world(seed)
-        place_inukshuks(self.world)
-        make_side_quests(self.world)
-        themes = ["stone", "stone", "ice", "mine", "lava"]
-        random.Random("%s:themes" % seed).shuffle(themes)
-        for d, theme in zip(self.world["dungeons"], themes + ["lair"]):
-            d["theme"] = theme
+        self.world = build_world(seed)
         self.world_area = Area("world", ("world",), self.world["grid"],
                                self.world["realm"], "deep")
         self.cache = {}
@@ -2517,6 +2588,8 @@ class Game:
         if self.overlay:
             if self.overlay == "won" and k in ("n", "N"):
                 self.new_game()
+            elif k != "Escape" and self.next_page():
+                pass
             elif self.overlay != "won" or k in ("Escape", "Return"):
                 self.overlay = None
                 self.render()
@@ -2542,6 +2615,8 @@ class Game:
             self.toggle_map()
         elif k in ("j", "J"):
             self.journal()
+        elif k in ("l", "L"):
+            self.blueberry()
         elif k in ("question", "slash", "h", "H", "F1"):
             self.show_help()
         elif k in ("v", "V"):
@@ -2613,6 +2688,8 @@ class Game:
                      "You set your canoe in the water and paddle off.",
                      "info")
         self.pos = [x, y]
+        if water:
+            self.tally("paddled")
         site = self.world["sites"].get((x, y)) if a.kind == "world" else None
         if site:
             self.enter_site(*site)
@@ -2912,9 +2989,16 @@ class Game:
             return
         self.kill(mob)
 
+    def tally(self, key, n=1):
+        """Count something thou didst, for the honours at the feast."""
+        t = self.p.setdefault("tally", {})
+        t[key] = t.get(key, 0) + n
+
     def kill(self, mob, verb="kill"):
         p = self.p
         self.area.mobs.remove(mob)
+        self.tally("kills")
+        self.tally("kill:" + mob.name)
         gold = random.randint(0, mob.xp // 2 + 1)
         if mob.boss:
             gold += 50 * mob.level
@@ -2989,6 +3073,7 @@ class Game:
                      "you shake off the spell." % cap(self.the(mob)), "info")
             return
         p["beaver"] = True
+        self.tally("beaver")
         p["hp"] = min(p["hp"], BEAVER_HP)
         self.say("%s points her gnarled staff at you and cackles... You "
                  "have been turned into a BEAVER!" % cap(self.the(mob)),
@@ -2998,6 +3083,7 @@ class Game:
                  "magic.", "info")
 
     def die(self):
+        self.tally("deaths")
         self.busy = True
         self.render()
         self.say("You have died...", "bad")
@@ -3150,6 +3236,8 @@ class Game:
         if self.busy or self.talk:
             return
         if self.overlay:
+            if self.next_page():
+                return
             if self.overlay == "won":
                 self.action_menu()
             else:
@@ -3251,6 +3339,7 @@ class Game:
         self.open_menu("Penultimate", [
             ("Help", self.show_help),
             ("Map", self.toggle_map),
+            ("Blueberry (to do, and thy particulars)", self.blueberry),
             ("Journal", self.journal),
             ("Zoom in", lambda: self.zoom(1)),
             ("Zoom out", lambda: self.zoom(-1)),
@@ -3328,7 +3417,10 @@ class Game:
             else:
                 self.say("You apologise to no one in particular. It feels "
                          "nice, anyway.", "info")
-        elif name == "Portage":
+        if name != "Portage":
+            self.tally("spells")
+        if name == "Portage":
+            self.tally("spells")
             self.say("You hoist your pack, take a deep breath... and find "
                      "yourself at the gates of Castle Canadian.", "quest")
             self.cache = {k: v for k, v in self.cache.items()
@@ -3355,6 +3447,7 @@ class Game:
     def fire(self, dx, dy):
         p, a = self.p, self.area
         aim, self.aim = self.aim, None
+        self.tally("spells" if "spell" in aim else "pucks")
         if aim.get("spell") == "Donutify":
             p["mp"] -= SPELLS["Donutify"].mp
             self.sound.play("spell")
@@ -3455,6 +3548,7 @@ class Game:
             return
         x, y = mob.x, mob.y
         if mob.hostile:
+            self.tally("donuts")
             self.kill(mob, "donutify")
         else:
             a.mobs.remove(mob)
@@ -3479,6 +3573,7 @@ class Game:
                      "info")
             return
         self.flags.add(key)
+        self.tally("inukshuks")
         p = self.p
         rng = random.Random("%s:%s" % (self.world["seed"], key))
         gold = rng.randint(60, 160)
@@ -3502,6 +3597,7 @@ class Game:
             self.say("You have no potions!", "info")
             return
         p["potions"] -= 1
+        self.tally("potions")
         heal = min(self.max_hp() - p["hp"], 15 + 5 * p["level"])
         p["hp"] += heal
         p["poison"] = False
@@ -3646,6 +3742,8 @@ class Game:
             if not w:
                 self.npc_say(mob, "Anything else, then?")
                 return
+        if w[:4] in ("sorr", "apol", "pard", "excu"):
+            self.tally("sorry")
         if not w or w.startswith("bye"):
             self.npc_say(mob, "Safe travels, and mind the geese!"
                          if mob.lord else random.choice(BYES))
@@ -3693,6 +3791,7 @@ class Game:
         q = self.world["side"][int(mob.goose)]
         self.area.mobs.remove(mob)
         self.flags.add("goose:" + q["id"])
+        self.tally("geese")
         town = self.world["towns"][q["town"]]["name"]
         self.say("You scoop up %s the goose. She honks indignantly and "
                  "nips your ear." % q["goose"], "quest")
@@ -3759,6 +3858,7 @@ class Game:
         p["gold"] += q["gold"]
         p["xp"] += q["xp"]
         self.side[q["id"]]["state"] = "done"
+        self.tally("errands")
         self.say("(+%d gold, +%d xp)" % (q["gold"], q["xp"]), "good")
         self.root.after(200, self.sound.play, "quest")
         self.save()
@@ -4036,13 +4136,19 @@ class Game:
                          "declare a holiday, with fireworks and pancakes. "
                          "And sorry it took so long to thank thee properly."
                          % self.world["realm"])
-            self.overlay = "won"
+            self.show_feast()
             self.root.after(300, self.sound.play, "quest")
             self.save()
             return
         self.npc_say(mob, "Welcome, %s! How may I help thee, eh? (Ask me "
                      "about thy QUEST.)" % p["name"])
         self.save()
+
+    def show_feast(self):
+        self.pages = self.feast_pages()
+        self.page = 0
+        self.overlay = "won"
+        self.render()
 
     def current_quest(self):
         for di in self.world["quests"]:
@@ -4263,14 +4369,11 @@ class Game:
         elif self.overlay == "help":
             self.draw_text_box(HELP)
         elif self.overlay == "won":
-            self.draw_text_box(
-                "VICTORY!\n\nMoosedain the Wicked is no more, and %s is "
-                "saved.\n\nLord Canadian has declared a national holiday,\n"
-                "and apologises for any inconvenience.\n\nYou finished at "
-                "level %d after %d turns.\n\nPress N for a new world, or "
-                "Escape to keep wandering." % (
-                    self.world["realm"], self.p["level"], self.turn),
-                ACCENT)
+            if not getattr(self, "pages", None):
+                self.pages, self.page = self.feast_pages(), 0
+            self.draw_text_box(self.pages[self.page], ACCENT)
+        elif self.overlay == "phone":
+            self.draw_text_box(self.pages[self.page], INK)
         if self.menu:
             self.draw_menu()
         self.render_chrome()
@@ -4385,6 +4488,246 @@ class Game:
             cond.append("BADLY HURT")
         self.condition.config(text="\n".join(cond))
         self.sound.tune = self.area.kind
+
+    # ── The MIM Blueberry ──
+
+    def blueberry(self):
+        """Thy Blueberry: the to-do list, then thy particulars."""
+        if self.busy or self.talk:
+            return
+        if self.overlay == "phone":
+            self.overlay = None
+            self.render()
+            return
+        self.menu = None
+        self.pages = [self.bb_todo(), self.bb_hero()]
+        self.page = 0
+        self.overlay = "phone"
+        self.sound.play("gold")
+        self.render()
+
+    def bb_head(self, app):
+        day, hour = self.clock()
+        return ["MIM BLUEBERRY  .ill  [|||]   Day %d, %d %s" % (
+            day, (hour - 1) % 12 + 1, "am" if hour < 12 else "pm"),
+            "-" * 46, app, ""]
+
+    def todo(self):
+        """What there is to do: (done, what), from where things stand."""
+        w, p, f = self.world, self.p, self.flags
+        castle = w["castle"]
+        out = []
+        for di in w["quests"]:
+            d = w["dungeons"][di]
+            if di in self.returned:
+                out.append((True, "%s, home at the castle" % cap(
+                    d["artifact"])))
+            elif di in self.held:
+                out.append((False, "Bring %s to Lord Canadian" %
+                            d["artifact"]))
+            else:
+                out.append((False, "Recover %s from %s (%s of the castle; "
+                            "%s guards it)" % (
+                                d["artifact"], d["name"],
+                                where(castle, (d["x"], d["y"])), d["boss"])))
+        if len(self.returned) == 4:
+            lair = w["dungeons"][5]
+            out.append(("final_quest" in f, "Take up the Maple Blade (ask "
+                        "Lord Canadian about thy QUEST)"))
+            if "final_quest" in f:
+                out.append(("moosedain_dead" in f, "Slay Moosedain in his "
+                            "lair, %s of the castle" % where(
+                                castle, (lair["x"], lair["y"]))))
+                out.append(("won" in f, "Tell Lord Canadian the news"))
+        if p["level"] < MAX_LEVEL and p["xp"] >= xp_needed(p["level"]):
+            out.append((False, "Visit Lord Canadian: thou art ready for "
+                        "level %d" % (p["level"] + 1)))
+        if p["beaver"]:
+            out.append((False, "Have Lord Canadian lift the beaver curse"))
+        if p["poison"]:
+            out.append((False, "Cure the poison (a healer, or Lord "
+                        "Canadian)"))
+        if p["food"] < 60:
+            out.append((False, "Buy food (an inn or a tavern)"))
+        if not p["potions"]:
+            out.append((False, "Buy healing potions (the House of "
+                        "Healing)"))
+        for q in w["side"]:
+            st = self.side.get(q["id"], {})
+            if st.get("state") != "active":
+                continue
+            town = w["towns"][q["town"]]
+            if q["kind"] == "hunt":
+                what = "Slay %d %s for %s (%d so far)" % (
+                    q["count"], plural(MONSTERS[q["monster"]].name),
+                    q["giver"], st.get("count", 0))
+            elif q["kind"] == "fetch":
+                what = "Find %s in %s, level %d, for %s" % (
+                    q["item"], w["dungeons"][q["dungeon"]]["name"],
+                    q["level"], q["giver"])
+            elif q["kind"] == "goose":
+                what = "Catch %s the goose, %s of %s" % (
+                    q["goose"], where((town["x"], town["y"]), q["home"]),
+                    town["name"])
+            else:
+                what = "Take %s to %s, %s in %s" % (
+                    q["item"], q["to"], SHOP_TITLES[q["to_shop"]],
+                    w["towns"][q["to_town"]]["name"])
+            if self.errand_ready(q["id"]):
+                what += ": DONE, back to %s in %s" % (q["giver"],
+                                                      town["name"])
+            out.append((False, what))
+        seen = sum(1 for x, y in w["inukshuks"]
+                   if "inuk:%d,%d" % (x, y) in f)
+        if p["canoe"] and seen < len(w["inukshuks"]):
+            out.append((False, "Paddle out to the inukshuks (%d of %d)" % (
+                seen, len(w["inukshuks"]))))
+        return out
+
+    def bb_todo(self):
+        w, f = self.world, self.flags
+        lines = self.bb_head("TO DO")
+        for done, text in self.todo():
+            parts = wrap(text, 42)
+            lines += [("[x] " if done else "[ ] ") + parts[0]] + [
+                "    " + x for x in parts[1:]]
+        lines += ["", "BBM from Lord Canadian:"]
+        di = self.current_quest()
+        lair = w["dungeons"][5]
+        if self.p["beaver"]:
+            msg = BBM["beaver"]
+        elif "won" in f:
+            msg = BBM["won"]
+        elif "moosedain_dead" in f:
+            msg = BBM["dead"]
+        elif "final_quest" in f:
+            msg = BBM["final"] % where(w["castle"], (lair["x"], lair["y"]))
+        elif not self.returned and not self.held and self.turn < 40:
+            msg = BBM["start"]
+        elif di is not None and di in self.held:
+            msg = BBM["held"] % w["dungeons"][di]["artifact"]
+        elif di is not None:
+            msg = BBM["relic"] % w["dungeons"][di]["artifact"]
+        else:
+            msg = BBM["start"]
+        lines += ["  " + x for x in wrap(msg, 44)]
+        lines += ["", "(Roll the trackball: any key, or a tap, for thy",
+                  "particulars.)"]
+        return "\n".join(lines)
+
+    def bb_hero(self):
+        p = self.p
+        t = p.get("tally", {})
+        need = ("%d" % xp_needed(p["level"]) if p["level"] < MAX_LEVEL
+                else "max")
+        lines = self.bb_head("THY PARTICULARS")
+        lines += [
+            "%s the %s%s, level %d" % (p["name"], p["class"],
+                                       " (a BEAVER)" if p["beaver"] else "",
+                                       p["level"]),
+            "",
+            "HP %d/%d   MP %d/%d   XP %d/%s" % (
+                max(0, p["hp"]), self.max_hp(), p["mp"], max_mp(p), p["xp"],
+                need),
+            "Str %d   Dex %d   Int %d" % (p["str"], p["dex"], p["int"]),
+            "Gold %d   Food %d   Potions %d" % (p["gold"], p["food"],
+                                                 p["potions"]),
+            "",
+            "Weapon: %s" % ("Teeth" if p["beaver"] else p["weapon"]),
+            "Armour: %s (AC %d)" % ("Fur" if p["beaver"] else p["armor"],
+                                    self.armour_ac())]
+        gear = (["a canoe"] if p["canoe"] else []) + (
+            ["a sling and %d pucks" % p["pucks"]] if p["sling"] else [])
+        if gear:
+            lines += wrap("Gear: " + ", ".join(gear), 46)
+        if p["spells"]:
+            lines += wrap("Spells: " + ", ".join(p["spells"]), 46)
+        lines += ["", "Relics home: %d of 4.  Errands done: %d." % (
+            len(self.returned), t.get("errands", 0)),
+            "Foes defeated: %d.  Days abroad: %d." % (
+                t.get("kills", 0), self.clock()[0]),
+            "", "(Any key, or a tap, puts it away.)"]
+        return "\n".join(lines)
+
+    # ── The feast ──
+
+    def feast_pages(self):
+        """The end: the feast, the honours, and what became of everyone."""
+        w, p = self.world, self.p
+        t = p.get("tally", {})
+        realm = w["realm"]
+        feast = [
+            "VICTORY!", "",
+            "Moosedain the Wicked is no more, and %s is saved." % realm, "",
+            "Lord Canadian declares a holiday, and a feast:",
+            "pancakes stacked to the rafters, maple syrup by",
+            "the barrel, poutine, butter tarts, and fireworks",
+            "over the castle. He apologises for the fireworks.", "",
+            "Thou finished at level %d, after %d day%s abroad." % (
+                p["level"], self.clock()[0],
+                "" if self.clock()[0] == 1 else "s"), "",
+            "(Return, or a tap: the honours.)"]
+        honours = []
+        kinds = [(n, k[5:]) for k, n in t.items() if k.startswith("kill:")]
+        if kinds:
+            n, name = max(kinds)
+            if n >= 5:
+                honours.append((n / 5.0, "Slayer of %d %s" % (n, cap(
+                    plural(name)))))
+        for key, need, title in HONOURS:
+            n = t.get(key, 0)
+            if n >= need:
+                text = title % ((n, "" if n == 1 else "s")
+                                if title.count("%") == 2 else (n,))
+                honours.append((n / float(need), text))
+        if not t.get("deaths"):
+            honours.append((1.2, "The Undying (never once fell)"))
+        if p["class"] == "Mage" and not t.get("kills"):
+            honours.append((3.0, "The Gentle Mage (no foe slain)"))
+        honours.sort(key=lambda h: -h[0])
+        titles = [h[1] for h in honours[:5]] or [
+            "Hero of %s (it says so on the scroll)" % realm]
+        page2 = ["THE ROYAL HONOURS", "",
+                 "Lord Canadian rises, clears his throat, apologises",
+                 "for clearing his throat, and names thee:", ""]
+        page2 += ["  * " + x for x in titles]
+        page2 += ["", "(Return, or a tap: what became of everyone.)"]
+        rng = random.Random("%s:after" % w["seed"])
+        towns = [x["name"] for x in w["towns"]]
+        rng.shuffle(towns)
+        after = list(TOWN_AFTER)
+        rng.shuffle(after)
+        later = ["WHAT BECAME OF EVERYONE", ""]
+        later += wrap("Lord Canadian is still apologising. He has sent a "
+                      "sorry card to every household in %s, and one to "
+                      "Moosedain's mother." % realm, 50)
+        for town, text in zip(towns[:3], after):
+            later += wrap(cap(text % town) + ".", 50)
+        helped = [q for q in w["side"]
+                  if self.side.get(q["id"], {}).get("state") == "done"]
+        for q in helped[:2]:
+            town = w["towns"][q["town"]]["name"]
+            if q["kind"] == "goose":
+                later += wrap("%s the goose was made a Royal Goose, and "
+                              "bites only nobility now." % q["goose"], 50)
+            else:
+                later += wrap("%s of %s still tells anyone who'll listen "
+                              "how thou helped." % (q["giver"], town), 50)
+        later += [""] + wrap(rng.choice(CLIFFHANGERS), 50)
+        later += ["", "Press N for a new world, or Escape to keep",
+                  "wandering."]
+        return ["\n".join(feast), "\n".join(page2), "\n".join(later)]
+
+    def next_page(self):
+        """Turn the page of the Blueberry or the feast; False at the
+        last one."""
+        pages = getattr(self, "pages", None)
+        if self.overlay in ("phone", "won") and pages and \
+                self.page < len(pages) - 1:
+            self.page += 1
+            self.render()
+            return True
+        return False
 
     # ── Commands ──
 
@@ -5450,8 +5793,90 @@ TILE_PNG = {
 # ── TILE DATA END
 
 
+# ── Checking ─────────────────────────────────────────────────────────────────
+
+
+def reach(area, start, passable):
+    """The squares of an area reachable from start over passable tiles."""
+    seen, q = {start}, deque([start])
+    while q:
+        x, y = q.popleft()
+        for dx, dy in DIRS:
+            n = (x + dx, y + dy)
+            if n not in seen and area.inside(*n) and \
+                    area.grid[n[1]][n[0]] in passable:
+                seen.add(n)
+                q.append(n)
+    return seen
+
+
+def selftest(seeds=8):
+    """Build every map, errand and tune of a few worlds, without a window,
+    and check that everything a hero needs can be reached."""
+    sites = {"town", "castle", "dungeon", "lair"}
+    for seed in range(seeds):
+        w = build_world(seed)
+        grid = w["grid"]
+        on_foot = flood(grid, w["castle"], LAND | sites)
+        by_canoe = flood(grid, w["castle"], LAND | sites | WATER |
+                         {"inukshuk"})
+        for t in w["towns"]:
+            assert (t["x"], t["y"]) in on_foot, (seed, t["name"])
+        for d in w["dungeons"]:
+            assert (d["x"], d["y"]) in on_foot, (seed, d["name"])
+        for x, y in w["inukshuks"]:
+            assert (x, y) in by_canoe, (seed, "inukshuk", x, y)
+        assert len(w["quests"]) == 4, seed
+        for q in w["side"]:
+            errand_text(w, q)
+            if q["kind"] == "goose":
+                assert tuple(q["home"]) in on_foot, (seed, q["id"])
+        floor = WALKABLE | {"counter"}
+        for ti, t in enumerate(w["towns"]):
+            town_rumours(w, (t["x"], t["y"]))
+            a = make_town(w, ti)
+            ok = reach(a, a.start, WALKABLE)
+            for m in a.mobs:
+                assert any(abs(m.x - x) + abs(m.y - y) <= 2 for x, y in ok), \
+                    (seed, t["name"], m.name)
+            for k in ("shop", "talk"):
+                for m in a.mobs:
+                    v = getattr(m, k, None)
+                    assert v is None or isinstance(v, (dict, str)), (seed, m)
+        c = make_castle(w)
+        ok = reach(c, c.start, floor)
+        lord = [m for m in c.mobs if m.lord]
+        assert lord and any(abs(lord[0].x - x) + abs(lord[0].y - y) <= 1
+                            for x, y in ok), seed
+        flags = set()
+        for di, d in enumerate(w["dungeons"]):
+            for level in range(1, d["levels"] + 1):
+                a = make_dungeon_level(w, di, level, flags)
+                assert a.grid[a.start[1]][a.start[0]] == "stairs_up"
+                walk = WALKABLE | {"gate"}
+                ok = reach(a, a.start, walk)
+                if level < d["levels"]:
+                    assert a.down in ok, (seed, d["name"], level)
+                for (x, y), item in a.items.items():
+                    if item == "key":
+                        assert (x, y) in reach(a, a.start, WALKABLE), \
+                            (seed, d["name"], level, "key")
+                for m in a.mobs:
+                    assert (m.x, m.y) in ok, (seed, d["name"], level, m.name)
+                for x, y in a.errand_chests:
+                    assert (x, y) in ok, (seed, d["name"], level, "errand")
+                if level == d["levels"] and d["boss"]:
+                    assert any(m.boss for m in a.mobs), (seed, d["name"])
+    for name in MUSIC:
+        render_tune(MUSIC[name])
+    print("ok")
+
+
 def main():
     if icon_args(sys.argv[1:]):
+        return
+    if "--selftest" in sys.argv:
+        selftest()
         return
     root = tk.Tk()
     set_window_icon(root)

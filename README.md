@@ -32,6 +32,18 @@ To build a macOS app with an icon:
 ./penultimate --build-app [DIR]
 ```
 
+To check a change without playing:
+
+```bash
+./penultimate --selftest
+```
+
+It builds eight whole worlds without a window: every town, the castle,
+every dungeon level, every errand, rumour and tune. It checks that a hero
+can reach the towns, the dungeons, the inukshuks (by canoe), every
+shopkeeper, Lord Canadian, the stairs down, each boss, each errand's chest,
+and each gate's key without going through the gate.
+
 ## Playing
 
 | Key | Action |
@@ -43,6 +55,7 @@ To build a macOS app with an icon:
 | P | Drink a healing potion |
 | M | Map of the lands you have seen |
 | J | Journal: your quest and your errands |
+| L | Thy MIM Blueberry: the to-do list, then thy particulars |
 | ? | Help |
 | + / − | Zoom in / out |
 | V | Sound effects on / off |
@@ -57,7 +70,7 @@ The game plays without a keyboard. **Tap or click** a square to walk there
 fight or talk, and tap yourself to wait. When aiming the sling or a spell,
 tap in the direction to fire. Spells, shopping and conversation topics
 appear as menus to tap. The buttons below the map (Wait, Sling, Cast,
-Potion, Map, Journal, Menu) cover the rest, with Menu holding help, zoom,
+Potion, Map, Blueberry, Menu) cover the rest, with Menu holding help, zoom,
 text size, sound, music, new game and quit. A menu too long for the screen
 scrolls (tap the arrows), and its last item (Bye, Nothing, Back) always
 stays in view.
@@ -87,7 +100,7 @@ and use the Gamepad controller layout.
 | X | Fire the sling |
 | Y | Cast a spell |
 | LB | Drink a potion |
-| RB | Journal |
+| RB | The Blueberry |
 | View | Map |
 | Start | Menu |
 
@@ -109,6 +122,17 @@ and they'll send you to slay monsters, fetch something stolen from a
 dungeon, catch a runaway goose, or carry a parcel to a shopkeeper in
 another town, for gold and experience. Each town has two errands; press J
 to see the ones you've taken on.
+
+**The MIM Blueberry.** Every hero carries a Blueberry, the enchanted
+message slate made by Magic im Motion of Waterloo. Press L, or tap the
+Blueberry button. Its first screen is a to-do list: each relic (still
+lost, in thy pack, or home), the Maple Blade and Moosedain, a level
+waiting at the castle, a curse or poison to see to, food or potions
+running out, every errand you've taken on (and which are done), and the
+inukshuks. Under it is the latest BBM from Lord Canadian, who is sorry to
+bother thee. Roll the trackball (any key, or a tap) for the second screen:
+thy particulars, which are your stats, gear, spells, relics, errands and
+foes.
 
 **Classes.** Fighters are tough and strong. Mages are frail but start with
 the Frost Bolt and Heal spells and have the most magic points. Rangers are
@@ -139,6 +163,14 @@ night at the inn wakes you at 8 am. The Light spell helps in the dark.
 **Wood witches** lurk in the forests and can turn you into a beaver: few
 hit points, only a bite to fight with, and no one understands you. Only
 Lord Canadian can turn you back.
+
+**The end.** Bring the news of Moosedain to Lord Canadian, and there's a
+feast (pancakes, poutine, butter tarts and fireworks, with apologies for
+the fireworks). He reads out thy royal honours, drawn from how you
+played: Slayer of 60 Rats, Royal Goosewrangler, Friend to Beavers, Most
+Apologetic, Voyageur of the Seven Lakes and so on. Then comes what became
+of everyone: the towns, the folk you helped, the geese, and Moosedain,
+who may not be quite done. Return or a tap turns the page.
 
 **Survival.** You eat as you travel, so buy rations at taverns. Swamps can
 poison you; healers and potions cure it. Monsters get tougher the farther

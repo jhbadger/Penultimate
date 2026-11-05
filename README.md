@@ -58,11 +58,19 @@ fight or talk, and tap yourself to wait. When aiming the sling or a spell,
 tap in the direction to fire. Spells, shopping and conversation topics
 appear as menus to tap. The buttons below the map (Wait, Sling, Cast,
 Potion, Map, Journal, Menu) cover the rest, with Menu holding help, zoom,
-sound, music, new game and quit.
+text size, sound, music, new game and quit. A menu too long for the screen
+scrolls (tap the arrows), and its last item (Bye, Nothing, Back) always
+stays in view.
+
+**Screen size:** the whole window scales to fit, on a desktop or a phone:
+the tiles, the text, the side panel and the buttons. A window taller than
+it is wide (a phone held upright) puts the side panel under the map, in two
+columns, and the buttons in two rows. Zoom changes how many tiles you see;
+Bigger and Smaller text in the Menu change the size of everything else.
 
 **Android:** install [Pydroid 3](https://play.google.com/store/apps/details?id=ru.iiec.pydroid3),
-open `penultimate` in it and run it. Tiles are scaled up for phone screens,
-and the on-screen keyboard only appears if you tap the box to type. For
+open `penultimate` in it and run it. The on-screen keyboard only appears if
+you tap the box to type. For
 sound, install `pyjnius` from Pydroid's pip menu (the game then plays
 through Android's own media player); `pygame` works too, as a fallback.
 

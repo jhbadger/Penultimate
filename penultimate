@@ -94,7 +94,6 @@ import wave
 import zlib
 from collections import namedtuple, deque
 from tkinter import font as tkfont
-from tkinter import messagebox
 
 SAVE_FILE = os.path.expanduser("~/.penultimate.json")
 ANDROID = hasattr(sys, "getandroidapilevel") or "ANDROID_ROOT" in os.environ
@@ -1809,6 +1808,70 @@ TALK = "#9fd3ff"
 GOLD = "#f0c85a"
 MONO = ("Menlo", 12)
 
+# ── Fitting the screen ──
+#
+# Every font is a named font sized in pixels, so the whole window can be
+# scaled to the screen: Game.fit() works out how big everything should be
+# from the window's size (a phone held upright gets a taller layout) and
+# set_fonts() resizes every font at once.
+
+FONTS = {}          # (family, size, style) -> tkfont.Font
+STD_FONTS = {}      # Tk's own fonts (buttons, dialogs): name -> pixels
+UI = [1.0]          # how much bigger than the design everything is
+PT = [1.0]          # pixels to a point, at the design size
+TEXT_SIZES = (0.8, 0.9, 1.0, 1.15, 1.3, 1.5, 1.75)
+
+
+def S(n):
+    """A length in pixels, scaled to the screen."""
+    return max(1, round(n * UI[0]))
+
+
+def font_px(size):
+    return -max(6, round(size * UI[0] * PT[0]))
+
+
+def F(family, size, style=""):
+    """A font that grows and shrinks with the window."""
+    key = (family, size, style or "")
+    f = FONTS.get(key)
+    if f is None:
+        f = FONTS[key] = tkfont.Font(
+            family=family, size=font_px(size),
+            weight="bold" if "bold" in (style or "") else "normal",
+            slant="italic" if "italic" in (style or "") else "roman")
+    return f
+
+
+def init_fonts(root):
+    PT[0] = 1.0 if ANDROID else float(root.tk.call("tk", "scaling"))
+    for name in tkfont.names(root):
+        if name.startswith("Tk"):
+            size = int(tkfont.nametofont(name).cget("size"))
+            STD_FONTS[name] = 13 if ANDROID else (
+                -size if size < 0 else size * PT[0])
+
+
+def set_fonts(u):
+    UI[0] = u
+    for (family, size, style), f in FONTS.items():
+        f.configure(size=font_px(size))
+    for name, px in STD_FONTS.items():
+        tkfont.nametofont(name).configure(size=-max(6, round(px * u)))
+
+
+def wrap(text, width):
+    out, line = [], ""
+    for word in text.split():
+        if line and len(line) + 1 + len(word) > width:
+            out.append(line)
+            line = word
+        else:
+            line = (line + " " + word) if line else word
+    if line:
+        out.append(line)
+    return out
+
 MOVE_KEYS = {"Up": (0, -1), "w": (0, -1), "KP_Up": (0, -1), "KP_8": (0, -1),
              "Down": (0, 1), "s": (0, 1), "KP_Down": (0, 1), "KP_2": (0, 1),
              "Left": (-1, 0), "a": (-1, 0), "KP_Left": (-1, 0),
@@ -1828,7 +1891,8 @@ C + number          cast a spell (aimed ones then
 P                   drink a healing potion
 M                   map of the lands you have seen
 J                   journal: your quest and errands
-+ / -               zoom in / out
++ / -               zoom in / out (the Menu also has bigger
+                    and smaller text)
 V                   sound effects on / off
 B                   music on / off
 N                   new game (a whole new world)
@@ -1863,14 +1927,13 @@ class Game:
         saved = load_saved()
         self.sound.muted = bool(saved.get("muted"))
         self.sound.music_off = bool(saved.get("music_off"))
-        scale = saved.get("scale")
-        if scale in range(1, MAX_ZOOM + 1):
-            self.scale = scale
-        elif ANDROID:           # tiles about a third of an inch across
-            dpi = root.winfo_fpixels("1i")
-            self.scale = max(3, min(MAX_ZOOM, round(dpi * 0.33 / 16)))
-        else:
-            self.scale = 3 if root.winfo_screenheight() >= 1000 else 2
+        zoom = saved.get("zoom")
+        self.zoom_d = zoom if zoom in range(-2, 3) else 0
+        text = saved.get("text")
+        self.text_k = text if text in TEXT_SIZES else 1.0
+        self.scale = 3 if root.winfo_screenheight() >= 1000 else 2
+        self.tall = None
+        init_fonts(root)
 
         root.title("Penultimate")
         root.configure(bg=PANEL)
@@ -1881,16 +1944,16 @@ class Game:
         top = tk.Frame(root, bg=PANEL)
         top.pack(fill="x")
         tk.Label(top, text="Penultimate", bg=PANEL, fg=ACCENT,
-                 font=("Helvetica", 16, "bold")).pack(side="left", padx=10,
+                 font=F("Helvetica", 16, "bold")).pack(side="left", padx=10,
                                                        pady=6)
         self.status = tk.Label(top, bg=PANEL, fg=INK_DIM,
-                               font=("Helvetica", 12))
+                               font=F("Helvetica", 12))
         self.status.pack(side="left", padx=10)
         self.turns = tk.Label(top, bg=PANEL, fg=INK_DIM,
-                              font=("Helvetica", 12))
+                              font=F("Helvetica", 12))
         self.turns.pack(side="right", padx=10)
 
-        bar = tk.Frame(root, bg=PANEL)
+        bar = self.bar = tk.Frame(root, bg=PANEL)
         bar.pack(side="bottom", fill="x")
         self.btn = {}
         for key, label, cmd in (("wait", "Wait", self.wait),
@@ -1900,27 +1963,31 @@ class Game:
                                 ("map", "Map", self.toggle_map),
                                 ("journal", "Journal", self.journal),
                                 ("menu", "Menu", self.action_menu)):
-            b = tk.Button(bar, text=label, command=cmd, width=8,
+            b = tk.Button(bar, text=label, command=cmd, width=7,
                           highlightbackground=PANEL, takefocus=0)
-            b.pack(side="left", expand=True, pady=6)
-            self.btn[key] = b
+            self.btn[key] = b       # placed by fit(), in one row or more
 
         body = tk.Frame(root, bg=PANEL)
         body.pack(fill="both", expand=True)
-        side = tk.Frame(body, bg=PANEL, width=230)
+        side = self.sidebar = tk.Frame(body, bg=PANEL, width=230)
         side.pack(side="right", fill="y")
         side.pack_propagate(False)
-        self.panel = tk.Label(side, bg=PANEL, fg=INK, font=MONO,
-                              justify="left", anchor="nw")
-        self.panel.pack(fill="x", padx=10, pady=(8, 0))
+        self.panelrow = tk.Frame(side, bg=PANEL)
+        self.panelrow.pack(fill="x")
+        self.panel = tk.Label(self.panelrow, bg=PANEL, fg=INK, font=F(*MONO),
+                              justify="left", anchor="nw", wraplength=S(210))
+        self.panel.pack(side="left", fill="x", expand=True, anchor="n",
+                        padx=10, pady=(8, 0))
+        self.panel2 = tk.Label(self.panelrow, bg=PANEL, fg=INK, font=F(*MONO),
+                               justify="left", anchor="nw", wraplength=S(210))
         self.condition = tk.Label(side, bg=PANEL, fg=BAD, justify="left",
-                                  anchor="nw",
-                                  font=("Menlo", 12, "bold"))
+                                  anchor="nw", font=F("Menlo", 12, "bold"),
+                                  wraplength=S(210))
         self.condition.pack(fill="x", padx=10)
 
-        left = tk.Frame(body, bg=PANEL)
+        left = self.leftside = tk.Frame(body, bg=PANEL)
         left.pack(side="left", fill="both", expand=True)
-        self.log = tk.Text(left, height=8, bg=LOG_BG, fg=INK, font=MONO,
+        self.log = tk.Text(left, height=8, bg=LOG_BG, fg=INK, font=F(*MONO),
                            wrap="word", bd=0, highlightthickness=0,
                            padx=8, pady=4, state="disabled", takefocus=0)
         self.log.pack(side="bottom", fill="x")
@@ -1928,12 +1995,12 @@ class Game:
                            ("bad", BAD), ("good", GOOD), ("gold", GOLD),
                            ("quest", ACCENT)):
             self.log.tag_configure(tag, foreground=color)
-        self.log.tag_configure("quest", font=("Menlo", 12, "bold"))
+        self.log.tag_configure("quest", font=F("Menlo", 12, "bold"))
         self.talkbar = tk.Frame(left, bg=PANEL)
         self.prompt = tk.Label(self.talkbar, text="Your interest:", bg=PANEL,
-                               fg=ACCENT, font=MONO)
+                               fg=ACCENT, font=F(*MONO))
         self.prompt.pack(side="left", padx=(8, 4), pady=4)
-        self.entry = tk.Entry(self.talkbar, bg=LOG_BG, fg=INK, font=MONO,
+        self.entry = tk.Entry(self.talkbar, bg=LOG_BG, fg=INK, font=F(*MONO),
                               insertbackground=INK, highlightthickness=0,
                               bd=1)
         self.entry.pack(side="left", fill="x", expand=True, padx=(0, 8),
@@ -1960,7 +2027,8 @@ class Game:
         self.cache = {}
 
         self.canvas.bind("<Configure>", lambda e: self.layout())
-        self.canvas.bind("<ButtonPress-1>", self.on_tap)
+        root.bind("<Configure>", self.on_resize, add="+")
+        self.canvas.bind("<ButtonPress-1>", self.tapped)
         root.bind("<KeyPress>", self.on_key)
         for k in ("Control-q", "Command-q"):
             root.bind("<%s>" % k, lambda e: self.quit())
@@ -1969,7 +2037,8 @@ class Game:
         try:
             self.restore(saved["game"])
         except (KeyError, TypeError, ValueError, IndexError, zlib.error):
-            self.new_game()
+            # once the window is up, so the dialog can be fitted to it
+            self.root.after(50, self.new_game)
         self.music_tick()
         self.animate()
         self.pad = Gamepad()
@@ -2138,64 +2207,114 @@ class Game:
                                self.world["realm"], "deep")
         self.cache = {}
 
-    def ask_hero(self):
-        """Character creation: a name and a class, or None if cancelled."""
+    def tapped(self, ev):
+        """A tap on the map, unless it's the tail of one on a dialog that
+        just closed (on Android it can land on the map behind), or there's
+        no game yet."""
+        if time.time() < getattr(self, "tap_guard", 0) or \
+                not getattr(self, "area", None):
+            return
+        self.on_tap(ev)
+
+    def open_dialog(self):
+        """Whether a dialog can open now (only one at a time)."""
+        dlg = getattr(self, "dialog", None)
+        try:
+            if dlg is not None and dlg.winfo_exists():
+                dlg.lift()
+                return False
+        except tk.TclError:
+            pass
+        return True
+
+    def close_dialog(self, dlg=None):
+        dlg = dlg or getattr(self, "dialog", None)
+        if dlg is not None:
+            try:
+                dlg.destroy()
+            except tk.TclError:
+                pass
+        if dlg is getattr(self, "dialog", None):
+            self.dialog = None
+        # a tap on a dialog button can land on the map behind it
+        self.tap_guard = time.time() + 0.6
+
+    def grab(self, dlg):
+        try:
+            dlg.grab_set()
+        except tk.TclError:
+            pass
+
+    def ask_hero(self, done):
+        """Character creation: a name and a class. The dialog carries on
+        from its own buttons, calling done((name, class)), or done(None) if
+        cancelled: on Android (Pydroid) wait_window doesn't wait."""
         root = self.root
-        dlg = tk.Toplevel(root, bg=PANEL, padx=18, pady=14)
+        if not self.open_dialog():
+            return
+        dlg = self.dialog = tk.Toplevel(root, bg=PANEL, padx=18, pady=14)
         dlg.title("A new hero")
         dlg.transient(root)
         dlg.resizable(False, False)
-        result = {}
         tk.Label(dlg, text="Who art thou, traveller?", bg=PANEL, fg=ACCENT,
-                 font=("Helvetica", 16, "bold")).pack(anchor="w")
+                 font=F("Helvetica", 16, "bold")).pack(anchor="w")
         row = tk.Frame(dlg, bg=PANEL)
         row.pack(fill="x", pady=(10, 8))
         tk.Label(row, text="Name:", bg=PANEL, fg=INK,
-                 font=("Helvetica", 13)).pack(side="left")
+                 font=F("Helvetica", 13)).pack(side="left")
         name = tk.Entry(row, bg=LOG_BG, fg=INK, insertbackground=INK,
-                        font=MONO, width=20, highlightthickness=0)
+                        font=F(*MONO), width=20, highlightthickness=0)
         name.insert(0, getattr(self, "p", START_PLAYER)["name"])
         name.pack(side="left", padx=8)
         cls = tk.StringVar(value="Fighter")
         for c, info in CLASSES.items():
             tk.Radiobutton(dlg, text=c, variable=cls, value=c, bg=PANEL,
                            fg=INK, selectcolor=LOG_BG, activebackground=PANEL,
-                           font=("Helvetica", 13, "bold"),
+                           font=F("Helvetica", 13, "bold"),
                            anchor="w").pack(fill="x")
             tk.Label(dlg, text=info["desc"], bg=PANEL, fg=INK_DIM,
-                     wraplength=360, justify="left",
-                     font=("Helvetica", 12)).pack(fill="x", padx=(26, 0))
+                     wraplength=S(360), justify="left",
+                     font=F("Helvetica", 12)).pack(fill="x", padx=(26, 0))
 
         def begin(_=None):
             n = " ".join(name.get().split())[:20]
-            result["hero"] = (n or "Avatar", cls.get())
-            dlg.destroy()
+            self.close_dialog(dlg)
+            done((n or "Avatar", cls.get()))
+
+        def cancel(_=None):
+            self.close_dialog(dlg)
+            done(None)
         bar = tk.Frame(dlg, bg=PANEL)
         bar.pack(fill="x", pady=(12, 0))
         tk.Button(bar, text="Begin", command=begin, width=9,
                   highlightbackground=PANEL).pack(side="right")
-        tk.Button(bar, text="Cancel", command=dlg.destroy, width=9,
+        tk.Button(bar, text="Cancel", command=cancel, width=9,
                   highlightbackground=PANEL).pack(side="right", padx=6)
         dlg.bind("<Return>", begin)
-        dlg.bind("<Escape>", lambda e: dlg.destroy())
+        dlg.bind("<Escape>", cancel)
+        dlg.protocol("WM_DELETE_WINDOW", cancel)
         name.focus_set()
         name.select_range(0, "end")
+        self.fit_dialog(dlg)
         dlg.update_idletasks()
         dlg.geometry("+%d+%d" % (
             root.winfo_rootx() + max(0, (root.winfo_width() -
                                          dlg.winfo_reqwidth()) // 2),
-            root.winfo_rooty() + 80))
-        dlg.grab_set()
-        root.wait_window(dlg)
-        return result.get("hero")
+            root.winfo_rooty() + max(0, min(80, (root.winfo_height() -
+                                                 dlg.winfo_reqheight()) //
+                                            2))))
+        self.grab(dlg)
 
     def new_game(self, hero=None):
         if hero is None:
-            hero = self.ask_hero()
-            if hero is None:
-                if getattr(self, "p", None):
-                    return              # cancelled: keep playing this game
-                hero = ("Avatar", "Fighter")
+            def chosen(h):
+                if h is None:
+                    if getattr(self, "p", None):
+                        return          # cancelled: keep playing this game
+                    h = ("Avatar", "Fighter")
+                self.new_game(h)
+            self.ask_hero(chosen)
+            return
         name, cls = hero
         c = CLASSES[cls]
         self.setup_world(random.randrange(1 << 31))
@@ -2269,7 +2388,7 @@ class Game:
 
     def save(self):
         data = {"muted": self.sound.muted, "music_off": self.sound.music_off,
-                "scale": self.scale}
+                "zoom": self.zoom_d, "text": self.text_k}
         if getattr(self, "p", None):
             data["game"] = {
                 "seed": self.world["seed"], "player": self.p,
@@ -2949,6 +3068,13 @@ class Game:
         self.render()
 
     def menu_pick(self, i=None):
+        if i in ("up", "down"):
+            m = self.menu
+            page = m.get("page", 1)
+            m["sel"] = max(0, min(len(m["items"]) - 2, m["sel"] + (
+                page if i == "down" else -page)))
+            self.render()
+            return
         m, self.menu = self.menu, None
         self.render()
         m["items"][m["sel"] if i is None else i][1]()
@@ -2962,33 +3088,50 @@ class Game:
     def draw_menu(self):
         c, m = self.canvas, self.menu
         W, H = c.winfo_width(), c.winfo_height()
-        if not hasattr(self, "menu_fonts"):
-            size = 17 if ANDROID else 14
-            self.menu_fonts = (tkfont.Font(family="Helvetica", size=size),
-                               tkfont.Font(family="Helvetica", size=size,
-                                           weight="bold"))
-        f, bold = self.menu_fonts
-        rh = f.metrics("linespace") + (18 if ANDROID else 10)
+        size = 16 if ANDROID else 14
+        f, bold = F("Helvetica", size), F("Helvetica", size, "bold")
+        rh = f.metrics("linespace") + S(16 if ANDROID else 10)
         labels = [label for label, _ in m["items"]]
+        title = m["title"]
         bw = min(W - 20, max([f.measure(t) for t in labels] +
-                             [bold.measure(m["title"])]) + 40)
-        fit = max(1, (H - 3 * rh) // rh)          # scroll long lists
-        first = max(0, min(m["sel"] - fit // 2, len(labels) - fit))
-        shown = labels[first:first + fit]
-        bh = (len(shown) + 1) * rh + 16
+                             [bold.measure(title)]) + 40)
+        if bold.measure(title) > bw - 40:
+            title = "\n".join(wrap(title, max(20, len(title) * (bw - 40) //
+                                              bold.measure(title))))
+        th = (title.count("\n") + 1) * rh
+        fit = max(1, (H - 2 * rh - th) // rh)
+        n_items = len(labels)
+        if n_items <= fit:
+            shown = list(enumerate(labels))
+        else:
+            # Too long for the screen: a scrolling window, with arrows to
+            # tap, and the last item (Bye, Nothing, Back) always in view.
+            page = max(1, fit - 3)
+            m["page"] = page
+            first = max(0, min(m["sel"] - page // 2, n_items - 1 - page))
+            shown = [("up", "\u25b2 more" if first else "")] + \
+                [(i, labels[i]) for i in range(first, first + page)] + \
+                [("down", "\u25bc more" if first + page < n_items - 1
+                  else ""), (n_items - 1, labels[-1])]
+        bh = len(shown) * rh + th + 16
         x0, y0 = (W - bw) // 2, max(8, (H - bh) // 2)
         c.create_rectangle(x0, y0, x0 + bw, y0 + bh, fill=PANEL,
                            outline=ACCENT, width=2, tags="overlay")
-        c.create_text(x0 + 20, y0 + 8 + rh // 2, text=m["title"], anchor="w",
+        c.create_text(x0 + 20, y0 + 8 + th // 2, text=title, anchor="w",
                       fill=ACCENT, font=bold, tags="overlay")
         self.menu_rows = []
-        for n, label in enumerate(shown):
-            i = first + n
-            ry = y0 + 8 + (n + 1) * rh
+        for n, (i, label) in enumerate(shown):
+            ry = y0 + 8 + th + n * rh
             if i == m["sel"]:
                 c.create_rectangle(x0 + 6, ry, x0 + bw - 6, ry + rh,
                                    fill="#3a2f1c", outline="",
                                    tags="overlay")
+            if isinstance(i, str):
+                if label:
+                    c.create_text(x0 + bw // 2, ry + rh // 2, text=label,
+                                  fill=ACCENT, font=f, tags="overlay")
+                    self.menu_rows.append((x0, ry, x0 + bw, ry + rh, i))
+                continue
             c.create_text(x0 + 20, ry + rh // 2, text=label, anchor="w",
                           fill=INK, font=f, tags="overlay")
             self.menu_rows.append((x0, ry, x0 + bw, ry + rh, i))
@@ -3111,6 +3254,8 @@ class Game:
             ("Journal", self.journal),
             ("Zoom in", lambda: self.zoom(1)),
             ("Zoom out", lambda: self.zoom(-1)),
+            ("Bigger text", lambda: self.text_size(1)),
+            ("Smaller text", lambda: self.text_size(-1)),
             ("Sound effects: %s" % ("off" if self.sound.muted else "on"),
              self.toggle_mute),
             ("Music: %s" % ("off" if self.sound.music_off else "on"),
@@ -3981,6 +4126,10 @@ class Game:
         if not hasattr(self, "area"):
             return
         c = self.canvas
+        scale = self.auto_scale()
+        if scale != self.scale:
+            self.scale = scale
+            self.scale_images()
         c.delete("all")
         ts = 16 * self.scale
         W, H = max(c.winfo_width(), ts * 5), max(c.winfo_height(), ts * 5)
@@ -4146,7 +4295,7 @@ class Game:
     def draw_text_box(self, text, color=INK):
         c = self.canvas
         W, H = c.winfo_width(), c.winfo_height()
-        t = c.create_text(W / 2, H / 2, text=text, fill=color, font=MONO,
+        t = c.create_text(W / 2, H / 2, text=text, fill=color, font=F(*MONO),
                           justify="left", tags="overlay")
         x0, y0, x1, y1 = c.bbox(t)
         r = c.create_rectangle(x0 - 20, y0 - 16, x1 + 20, y1 + 16,
@@ -4179,7 +4328,7 @@ class Game:
         c.create_rectangle(mx + px * z - 2, my + py * z - 2,
                            mx + (px + 1) * z + 2, my + (py + 1) * z + 2,
                            outline="#ffff00", width=2, tags="overlay")
-        c.create_text(W / 2, my - 14, fill=ACCENT, font=MONO, tags="overlay",
+        c.create_text(W / 2, my - 14, fill=ACCENT, font=F(*MONO), tags="overlay",
                       text="Map of %s   (white: castle, red: towns, orange: "
                       "dungeons; any key closes)" % self.world["realm"])
 
@@ -4222,7 +4371,7 @@ class Game:
             lines += ["", "Moosedain is slain!"]
         elif "final_quest" in self.flags:
             lines += ["", "Slay Moosedain!"]
-        self.panel.config(text="\n".join(lines))
+        self.show_panel(lines)
         cond = []
         if p["beaver"]:
             cond.append("BEAVER")
@@ -4252,11 +4401,139 @@ class Game:
         self.render()
 
     def zoom(self, d):
-        s = min(MAX_ZOOM, max(1, self.scale + d))
-        if s != self.scale:
-            self.scale = s
-            self.scale_images()
+        z = max(-2, min(2, self.zoom_d + d))
+        if z != self.zoom_d:
+            self.zoom_d = z
             self.layout()
+
+    def auto_scale(self):
+        """Tiles big enough that the shorter side of the map shows about
+        thirteen, plus however far the player has zoomed."""
+        c = self.canvas
+        short = min(c.winfo_width(), c.winfo_height())
+        return max(1, min(MAX_ZOOM, round(short / (16 * 13)) + self.zoom_d))
+
+    def on_resize(self, ev):
+        if ev.widget is self.root:
+            if getattr(self, "fit_job", None):
+                self.root.after_cancel(self.fit_job)
+            self.fit_job = self.root.after(80, self.fit)
+
+    def fit(self, force=False):
+        """Scale the fonts, the side panel and the buttons to the window:
+        a wide window has the panel at the side and one row of buttons, a
+        tall one (a phone held upright) the panel underneath and two."""
+        self.fit_job = None
+        if getattr(self, "small_dialog", None) and not force:
+            return
+        root = self.root
+        W, H = root.winfo_width(), root.winfo_height()
+        if W < 100 or H < 100:
+            return
+        tall = H > W * 1.15
+        u = min(W / 620, H / 1000) if tall else min(W / 1000, H / 740)
+        u = max(0.6, min(4.0, u)) * self.text_k
+        if not force and abs(u - UI[0]) < 0.02 and \
+                tall == getattr(self, "tall", None):
+            return
+        self.tall = tall
+        set_fonts(u)
+        n = len(self.btn)
+        root.update_idletasks()
+        each = max(b.winfo_reqwidth() for b in self.btn.values()) + S(4)
+        rows = 2 if tall else 1
+        while rows < n and -(-n // rows) * each > W:
+            rows += 1
+        per = -(-n // rows)
+        for i, b in enumerate(self.btn.values()):
+            b.grid(row=i // per, column=i % per, sticky="ew", padx=S(2),
+                   pady=S(4))
+        for col in range(n):
+            self.bar.columnconfigure(col, weight=int(col < per),
+                                     uniform="b" if col < per else "")
+        sb = self.sidebar
+        sb.pack_forget()
+        if tall:
+            sb.pack_propagate(True)
+            sb.pack(side="bottom", fill="x", before=self.leftside)
+            wrapl = (W - S(50)) // 2
+        else:
+            sb.configure(width=S(230))
+            sb.pack_propagate(False)
+            sb.pack(side="right", fill="y", before=self.leftside)
+            wrapl = S(210)
+        for w in (self.panel, self.panel2, self.condition):
+            w.configure(wraplength=wrapl if w is not self.condition or
+                        not tall else W - S(24))
+        if hasattr(self, "panel_lines"):
+            self.show_panel(self.panel_lines)
+        self.layout()
+
+    def show_panel(self, lines):
+        """The side panel: one column beside the map, or two underneath it
+        on a phone held upright, split at the blank line nearest halfway."""
+        self.panel_lines = lines
+        if not self.tall or len(lines) < 8:
+            self.panel.config(text="\n".join(lines))
+            self.panel2.pack_forget()
+            return
+        mid = len(lines) // 2
+        cuts = [i for i, line in enumerate(lines) if not line.strip()]
+        cut = min(cuts, key=lambda i: abs(i - mid)) if cuts else mid
+        if abs(cut - mid) > len(lines) // 4:
+            cut = mid
+        first, second = lines[:cut], lines[cut:]
+        while second and not second[0].strip():
+            second = second[1:]
+        self.panel.config(text="\n".join(first))
+        self.panel2.config(text="\n".join(second))
+        if not self.panel2.winfo_manager():
+            self.panel2.pack(side="left", fill="x", expand=True, anchor="n",
+                             padx=(S(10), S(10)), pady=(S(8), 0))
+
+    def fit_dialog(self, dlg):
+        """Shrink a dialog that's too big for the window until it fits;
+        everything goes back to its usual size when it closes."""
+        root = self.root
+        root.update_idletasks()
+        self.fit()
+        W, H = root.winfo_width(), root.winfo_height()
+        if W < 100:
+            return
+        shrunk = False
+        for _ in range(5):
+            dlg.update_idletasks()
+            k = min(1.0, (W - 8) / max(1, dlg.winfo_reqwidth()),
+                    (H - 8) / max(1, dlg.winfo_reqheight()))
+            if k >= 1.0:
+                break
+            shrunk = True
+            set_fonts(UI[0] * k * 0.97)
+            todo = [dlg]
+            while todo:
+                w = todo.pop()
+                todo += w.winfo_children()
+                try:
+                    wl = int(w.cget("wraplength"))
+                except (tk.TclError, ValueError):
+                    continue
+                if wl:
+                    w.configure(wraplength=max(60, int(wl * k)))
+        if shrunk:
+            self.small_dialog = dlg
+
+            def closed(e):
+                if e.widget is dlg:
+                    self.small_dialog = None
+                    self.root.after_idle(self.fit, True)
+            dlg.bind("<Destroy>", closed, add="+")
+
+    def text_size(self, d):
+        i = TEXT_SIZES.index(self.text_k) + d
+        if 0 <= i < len(TEXT_SIZES):
+            self.text_k = TEXT_SIZES[i]
+            self.fit(True)
+            self.say("(Text size %d%%.)" % round(self.text_k * 100), "info")
 
     def toggle_mute(self):
         self.sound.muted = not self.sound.muted
@@ -4270,10 +4547,12 @@ class Game:
     def ask_new_game(self):
         if self.busy:
             return
-        if "won" in self.flags or messagebox.askyesno(
-                "New game", "Abandon this game and start again in a whole "
-                "new world?", parent=self.root):
+        if "won" in self.flags:
             self.new_game()
+            return
+        self.open_menu("Abandon this game, and start again in a whole new "
+                       "world?", [("Yes, a new world", self.new_game),
+                                  ("No, keep playing", lambda: None)])
 
 
 # ------------------------------------------------ icon / macOS app bundle

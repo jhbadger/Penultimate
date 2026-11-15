@@ -64,6 +64,10 @@ paplay or aplay if one is available, on Android with pyjnius, or with
 pygame's mixer; otherwise the game is silent.  The
 music is rendered once and cached in ~/.cache/penultimate.
 
+Kivy:                penultimate --kivy   (or PENULTIMATE_UI=kivy) plays it in
+                     a Kivy window; a Python without Tk uses Kivy by itself
+Android app:         penultimate --build-android [DIR]   a folder for
+                     Buildozer (main.py, icon, buildozer.spec, build.sh)
 App bundle (macOS):  penultimate --build-app [DIR]   builds penultimate.app
                      penultimate --icon-png SIZE [OUT.png]
 
@@ -89,14 +93,34 @@ import sys
 import tempfile
 import threading
 import time
-import tkinter as tk
 import wave
 import zlib
 from collections import namedtuple, deque
-from tkinter import font as tkfont
+try:
+    import tkinter as tk
+    from tkinter import font as tkfont
+except ImportError:                 # a Python with only Kivy: see main()
+    tk = tkfont = None
 
-SAVE_FILE = os.path.expanduser("~/.penultimate.json")
 ANDROID = hasattr(sys, "getandroidapilevel") or "ANDROID_ROOT" in os.environ
+
+
+def home_dir():
+    """Where the save and the music cache go: your home folder, or, if
+    that can't be written to (as may be so in the Android app built with
+    --build-android), the app's own private folder."""
+    home = os.path.expanduser("~")
+    if home != "~" and os.access(home, os.W_OK):
+        return home
+    for d in (os.environ.get("ANDROID_PRIVATE"), os.getcwd(),
+              tempfile.gettempdir()):
+        if d and os.access(d, os.W_OK):
+            return d
+    return home
+
+
+HOME_DIR = home_dir()
+SAVE_FILE = os.path.join(HOME_DIR, ".penultimate.json")
 
 # ── Terrain ──────────────────────────────────────────────────────────────────
 #
@@ -1309,7 +1333,7 @@ def dungeon_monster(d, level):
 # with whatever command-line player the system has.
 
 RATE = 22050
-MUSIC_CACHE = os.path.expanduser("~/.cache/penultimate")
+MUSIC_CACHE = os.path.join(HOME_DIR, ".cache", "penultimate")
 MUSIC_VOLUME = 0.6              # relative to the sound effects
 
 # ── Music ────────────────────────────────────────────────────────────────────
@@ -1880,15 +1904,17 @@ BAD = "#ff8a7a"
 TALK = "#9fd3ff"
 GOLD = "#f0c85a"
 MONO = ("Menlo", 12)
+LOG_TAGS = {"info": INK_DIM, "talk": TALK, "you": ACCENT, "bad": BAD,
+            "good": GOOD, "gold": GOLD, "quest": ACCENT}
 
 # ── Fitting the screen ──
 #
-# Every font is a named font sized in pixels, so the whole window can be
-# scaled to the screen: Game.fit() works out how big everything should be
-# from the window's size (a phone held upright gets a taller layout) and
-# set_fonts() resizes every font at once.
+# The whole window is scaled to the screen: Game.fit() works out how big
+# everything should be from the window's size (a phone held upright gets a
+# taller layout), and the shell resizes every font at once.  F() names a
+# font; each display layer (Tk or Kivy, below) makes its own of it.
 
-FONTS = {}          # (family, size, style) -> tkfont.Font
+FONTS = {}          # Tk: (family, size, style) -> tkfont.Font
 STD_FONTS = {}      # Tk's own fonts (buttons, dialogs): name -> pixels
 UI = [1.0]          # how much bigger than the design everything is
 PT = [1.0]          # pixels to a point, at the design size
@@ -1905,14 +1931,20 @@ def font_px(size):
 
 
 def F(family, size, style=""):
-    """A font that grows and shrinks with the window."""
-    key = (family, size, style or "")
-    f = FONTS.get(key)
+    """A font that grows and shrinks with the window: (family, size,
+    style), which the display layer turns into one of its own."""
+    return (family, size, style or "")
+
+
+def tkf(font):
+    """F()'s font as a Tk font."""
+    f = FONTS.get(font)
     if f is None:
-        f = FONTS[key] = tkfont.Font(
+        family, size, style = font
+        f = FONTS[font] = tkfont.Font(
             family=family, size=font_px(size),
-            weight="bold" if "bold" in (style or "") else "normal",
-            slant="italic" if "italic" in (style or "") else "roman")
+            weight="bold" if "bold" in style else "normal",
+            slant="italic" if "italic" in style else "roman")
     return f
 
 
@@ -1995,52 +2027,182 @@ LB potion, RB Blueberry, View map, Start menu.
 Press any key to close."""
 
 
-class Game:
+# ── The display layer ───────────────────────────────────────────────────────
+# The game draws through two objects: a shell (the window round the map:
+# the bars, the side panel, the log, the "Your interest:" entry, the
+# buttons, the hero dialog, the clock and the keys) and a screen (the map:
+# a grid of tiles, two sprites, and an overlay of menus, the map of the
+# realm and pages of text).  Here they are in Tk; further on, in Kivy.
+# Screens count pixels from the top left of the map.
+
+Key = namedtuple("Key", "keysym state")
+Key.__doc__ = """A key press, as Tk gives it: a keysym ("Up", "KP_8", "a",
+"question") and the state of the modifiers (0x04 Control, 0x08 Alt)."""
+Tap = namedtuple("Tap", "x y")
+Tap.__doc__ = """A tap or click on the map, in pixels from its top left."""
+
+
+class TkScreen:
+    """The map in Tk: a canvas of tile images, two to a square (the ground
+    and what stands on it), a flash and a missile over them, and over all
+    of those the overlay."""
+
+    def __init__(self, canvas):
+        self.c = canvas
+        self.cells = []
+        self.fx = self.missile = None
+
+    def size(self):
+        return self.c.winfo_width(), self.c.winfo_height()
+
+    def load_tiles(self):
+        """16px tiles from TILE_PNG, darkened copies of the terrain (for
+        remembered dungeon squares); returns each terrain's average colour,
+        for the map."""
+        self.base, self.dark, avg = {}, {}, {}
+        for name, data in TILE_PNG.items():
+            img = tk.PhotoImage(data="".join(data))
+            self.base[name] = img
+            if name.split("@")[0] in SPRITES:
+                continue
+            rows, tot = [], [0, 0, 0]
+            for y in range(16):
+                row = []
+                for x in range(16):
+                    c = img.get(x, y)
+                    if isinstance(c, str):
+                        c = tuple(int(v) for v in c.split())
+                    for i in range(3):
+                        tot[i] += c[i]
+                    row.append("#%02x%02x%02x" % tuple(int(v * 0.38)
+                                                       for v in c[:3]))
+                rows.append("{" + " ".join(row) + "}")
+            dark = tk.PhotoImage(width=16, height=16)
+            dark.put(" ".join(rows))
+            self.dark[name] = dark
+            avg[name] = "#%02x%02x%02x" % tuple(v // 256 for v in tot)
+        return avg
+
+    def set_scale(self, s):
+        self.img = {n: i.zoom(s) for n, i in self.base.items()}
+        self.dimg = {n: i.zoom(s) for n, i in self.dark.items()}
+
+    def grid(self, cols, rows, ox, oy, ts):
+        """Clear everything, and lay out cols x rows empty squares of ts
+        pixels from ox, oy."""
+        c = self.c
+        c.delete("all")
+        self.cells = []
+        for j in range(rows):
+            for i in range(cols):
+                x, y = ox + i * ts, oy + j * ts
+                self.cells.append((
+                    c.create_image(x, y, anchor="nw", state="hidden"),
+                    c.create_image(x, y, anchor="nw", state="hidden")))
+        self.fx = c.create_image(0, 0, anchor="nw", state="hidden")
+        self.missile = c.create_image(0, 0, anchor="nw", state="hidden")
+
+    def cell(self, idx, layer, name):
+        """Show a tile in a square (layer 0 the ground, 1 what's on it):
+        None for nothing, "~name" for the darkened, remembered one."""
+        item = self.cells[idx][layer]
+        if name is None:
+            self.c.itemconfig(item, state="hidden")
+        elif name[0] == "~":
+            self.c.itemconfig(item, image=self.dimg[name[1:]],
+                              state="normal")
+        else:
+            self.c.itemconfig(item, image=self.img[name], state="normal")
+
+    def sprite(self, which, x, y, name):
+        """Show the "fx" or "missile" sprite at x, y (None hides it)."""
+        item = self.fx if which == "fx" else self.missile
+        if name is None:
+            self.c.itemconfig(item, state="hidden")
+            return
+        self.c.coords(item, x, y)
+        self.c.itemconfig(item, image=self.img[name], state="normal")
+        self.c.tag_raise(item)
+
+    # The overlay.
+
+    def clear_overlay(self):
+        self.c.delete("overlay")
+
+    def rect(self, x0, y0, x1, y1, fill="", outline="", width=1):
+        self.c.create_rectangle(x0, y0, x1, y1, fill=fill, outline=outline,
+                                width=width, tags="overlay")
+
+    def text(self, x, y, text, font, fill, anchor="center", justify="left"):
+        self.c.create_text(x, y, text=text, fill=fill, font=tkf(font),
+                           anchor=anchor, justify=justify, tags="overlay")
+
+    def measure(self, font, s):
+        return tkf(font).measure(s)
+
+    def linespace(self, font):
+        return tkf(font).metrics("linespace")
+
+    def text_size(self, text, font):
+        lines = text.split("\n")
+        return (max(self.measure(font, s) for s in lines),
+                len(lines) * self.linespace(font))
+
+    def map_image(self, rows, z, x, y):
+        """A picture of rows of "#rrggbb" colours, each pixel z square."""
+        img = tk.PhotoImage(width=len(rows[0]), height=len(rows))
+        img.put(" ".join("{" + " ".join(r) + "}" for r in rows))
+        self.map_img = img.zoom(z)
+        self.c.create_image(x, y, image=self.map_img, anchor="nw",
+                            tags="overlay")
+
+
+class TkShell:
+    """The window round the map, in Tk."""
+
     def __init__(self, root):
         self.root = root
-        self.sound = Sound()
-        saved = load_saved()
-        self.sound.muted = bool(saved.get("muted"))
-        self.sound.music_off = bool(saved.get("music_off"))
-        zoom = saved.get("zoom")
-        self.zoom_d = zoom if zoom in range(-2, 3) else 0
-        text = saved.get("text")
-        self.text_k = text if text in TEXT_SIZES else 1.0
-        self.scale = 3 if root.winfo_screenheight() >= 1000 else 2
-        self.tall = None
+        self.dialog = None
+        self.small_dialog = None
+        self.tap_guard = 0          # until when a tap on the map is ignored
         init_fonts(root)
 
+    def screen_height(self):
+        return self.root.winfo_screenheight()
+
+    def window_size(self):
+        return self.root.winfo_width(), self.root.winfo_height()
+
+    def build(self, game, buttons, big):
+        """The window's parts, with the buttons ((key, label, command), ...)
+        and the game listening to them; returns the screen."""
+        self.game = game
+        root = self.root
         root.title("Penultimate")
         root.configure(bg=PANEL)
         if not ANDROID:
             root.minsize(720, 560)
-            root.geometry("1180x860" if self.scale >= 3 else "980x720")
+            root.geometry("1180x860" if big else "980x720")
 
         top = tk.Frame(root, bg=PANEL)
         top.pack(fill="x")
         tk.Label(top, text="Penultimate", bg=PANEL, fg=ACCENT,
-                 font=F("Helvetica", 16, "bold")).pack(side="left", padx=10,
-                                                       pady=6)
+                 font=tkf(F("Helvetica", 16, "bold"))).pack(
+                     side="left", padx=10, pady=6)
         self.status = tk.Label(top, bg=PANEL, fg=INK_DIM,
-                               font=F("Helvetica", 12))
+                               font=tkf(F("Helvetica", 12)))
         self.status.pack(side="left", padx=10)
         self.turns = tk.Label(top, bg=PANEL, fg=INK_DIM,
-                              font=F("Helvetica", 12))
+                              font=tkf(F("Helvetica", 12)))
         self.turns.pack(side="right", padx=10)
 
         bar = self.bar = tk.Frame(root, bg=PANEL)
         bar.pack(side="bottom", fill="x")
         self.btn = {}
-        for key, label, cmd in (("wait", "Wait", self.wait),
-                                ("sling", "Sling", self.ready_sling),
-                                ("cast", "Cast", self.choose_spell),
-                                ("potion", "Potion", self.drink),
-                                ("map", "Map", self.toggle_map),
-                                ("phone", "Blueberry", self.blueberry),
-                                ("menu", "Menu", self.action_menu)):
+        for key, label, cmd in buttons:
             b = tk.Button(bar, text=label, command=cmd, width=7,
                           highlightbackground=PANEL, takefocus=0)
-            self.btn[key] = b       # placed by fit(), in one row or more
+            self.btn[key] = b       # placed by arrange(), in one row or more
 
         body = tk.Frame(root, bg=PANEL)
         body.pack(fill="both", expand=True)
@@ -2049,44 +2211,1153 @@ class Game:
         side.pack_propagate(False)
         self.panelrow = tk.Frame(side, bg=PANEL)
         self.panelrow.pack(fill="x")
-        self.panel = tk.Label(self.panelrow, bg=PANEL, fg=INK, font=F(*MONO),
+        mono = tkf(F(*MONO))
+        self.panel = tk.Label(self.panelrow, bg=PANEL, fg=INK, font=mono,
                               justify="left", anchor="nw", wraplength=S(210))
         self.panel.pack(side="left", fill="x", expand=True, anchor="n",
                         padx=10, pady=(8, 0))
-        self.panel2 = tk.Label(self.panelrow, bg=PANEL, fg=INK, font=F(*MONO),
+        self.panel2 = tk.Label(self.panelrow, bg=PANEL, fg=INK, font=mono,
                                justify="left", anchor="nw", wraplength=S(210))
         self.condition = tk.Label(side, bg=PANEL, fg=BAD, justify="left",
-                                  anchor="nw", font=F("Menlo", 12, "bold"),
+                                  anchor="nw",
+                                  font=tkf(F("Menlo", 12, "bold")),
                                   wraplength=S(210))
         self.condition.pack(fill="x", padx=10)
 
         left = self.leftside = tk.Frame(body, bg=PANEL)
         left.pack(side="left", fill="both", expand=True)
-        self.log = tk.Text(left, height=8, bg=LOG_BG, fg=INK, font=F(*MONO),
+        self.log = tk.Text(left, height=8, bg=LOG_BG, fg=INK, font=mono,
                            wrap="word", bd=0, highlightthickness=0,
                            padx=8, pady=4, state="disabled", takefocus=0)
         self.log.pack(side="bottom", fill="x")
-        for tag, color in (("info", INK_DIM), ("talk", TALK), ("you", ACCENT),
-                           ("bad", BAD), ("good", GOOD), ("gold", GOLD),
-                           ("quest", ACCENT)):
+        for tag, color in LOG_TAGS.items():
             self.log.tag_configure(tag, foreground=color)
-        self.log.tag_configure("quest", font=F("Menlo", 12, "bold"))
+        self.log.tag_configure("quest", font=tkf(F("Menlo", 12, "bold")))
         self.talkbar = tk.Frame(left, bg=PANEL)
         self.prompt = tk.Label(self.talkbar, text="Your interest:", bg=PANEL,
-                               fg=ACCENT, font=F(*MONO))
+                               fg=ACCENT, font=mono)
         self.prompt.pack(side="left", padx=(8, 4), pady=4)
-        self.entry = tk.Entry(self.talkbar, bg=LOG_BG, fg=INK, font=F(*MONO),
+        self.entry = tk.Entry(self.talkbar, bg=LOG_BG, fg=INK, font=mono,
                               insertbackground=INK, highlightthickness=0,
                               bd=1)
         self.entry.pack(side="left", fill="x", expand=True, padx=(0, 8),
                         pady=4)
-        self.entry.bind("<Return>", self.on_entry)
-        self.entry.bind("<Escape>", lambda e: self.end_talk())
+        self.entry.bind("<Return>", lambda e: game.on_entry())
+        self.entry.bind("<Escape>", lambda e: game.end_talk())
         self.canvas = tk.Canvas(left, bg="black", highlightthickness=0)
         self.canvas.pack(fill="both", expand=True)
 
-        self.load_images()
+        self.canvas.bind("<Configure>", lambda e: game.layout())
+        root.bind("<Configure>", lambda e: e.widget is root and
+                  game.on_resize(), add="+")
+        self.canvas.bind("<ButtonPress-1>", game.tapped)
+        root.bind("<KeyPress>", game.on_key)
+        for k in ("Control-q", "Command-q"):
+            root.bind("<%s>" % k, lambda e: game.quit())
+        root.protocol("WM_DELETE_WINDOW", game.quit)
+        return TkScreen(self.canvas)
+
+    def set_ui_scale(self, u):
+        set_fonts(u)
+
+    def arrange(self, tall, W):
+        """Wide: the panel at the side, the buttons in a row; tall (a phone
+        held upright): the panel underneath, the buttons in rows."""
+        n = len(self.btn)
+        self.root.update_idletasks()
+        each = max(b.winfo_reqwidth() for b in self.btn.values()) + S(4)
+        rows = 2 if tall else 1
+        while rows < n and -(-n // rows) * each > W:
+            rows += 1
+        per = -(-n // rows)
+        for i, b in enumerate(self.btn.values()):
+            b.grid(row=i // per, column=i % per, sticky="ew", padx=S(2),
+                   pady=S(4))
+        for col in range(n):
+            self.bar.columnconfigure(col, weight=int(col < per),
+                                     uniform="b" if col < per else "")
+        sb = self.sidebar
+        sb.pack_forget()
+        if tall:
+            sb.pack_propagate(True)
+            sb.pack(side="bottom", fill="x", before=self.leftside)
+            wrapl = (W - S(50)) // 2
+        else:
+            sb.configure(width=S(230))
+            sb.pack_propagate(False)
+            sb.pack(side="right", fill="y", before=self.leftside)
+            wrapl = S(210)
+        for w in (self.panel, self.panel2, self.condition):
+            w.configure(wraplength=wrapl if w is not self.condition or
+                        not tall else W - S(24))
+
+    # What the window shows round the map.
+
+    def set_status(self, text):
+        self.status.config(text=text)
+
+    def set_clock(self, text):
+        self.turns.config(text=text)
+
+    def set_condition(self, text):
+        self.condition.config(text=text)
+
+    def set_panel(self, first, second=None):
+        """The side panel, in one column, or two (a phone held upright)."""
+        self.panel.config(text="\n".join(first))
+        if second is None:
+            self.panel2.pack_forget()
+            return
+        self.panel2.config(text="\n".join(second))
+        if not self.panel2.winfo_manager():
+            self.panel2.pack(side="left", fill="x", expand=True, anchor="n",
+                             padx=(S(10), S(10)), pady=(S(8), 0))
+
+    def log_add(self, text, tag=None):
+        log = self.log
+        log.config(state="normal")
+        log.insert("end", text + "\n", tag or ())
+        n = int(log.index("end").split(".")[0])
+        if n > 500:
+            log.delete("1.0", "%d.0" % (n - 400))
+        log.config(state="disabled")
+        log.see("end")
+
+    def log_clear(self):
+        self.log.config(state="normal")
+        self.log.delete("1.0", "end")
+        self.log.config(state="disabled")
+
+    # The "Your interest:" entry.
+
+    def show_entry(self, focus):
+        self.talkbar.pack(side="bottom", fill="x", before=self.log)
+        self.prompt.config(text="Your interest:")
+        self.entry.delete(0, "end")
+        if focus:
+            self.entry.focus_set()
+
+    def set_prompt(self, text):
+        self.prompt.config(text=text)
+
+    def hide_entry(self):
+        self.talkbar.pack_forget()
+        self.canvas.focus_set()
+
+    def take_entry(self):
+        text = self.entry.get()
+        self.entry.delete(0, "end")
+        return text
+
+    # Time.
+
+    def after(self, ms, fn, *args):
+        return self.root.after(ms, fn, *args)
+
+    def after_idle(self, fn, *args):
+        return self.root.after_idle(fn, *args)
+
+    def cancel(self, job):
+        self.root.after_cancel(job)
+
+    # The hero dialog.
+
+    def open_dialog(self):
+        """Whether a dialog can open now (only one at a time)."""
+        dlg = self.dialog
+        try:
+            if dlg is not None and dlg.winfo_exists():
+                dlg.lift()
+                return False
+        except tk.TclError:
+            pass
+        return True
+
+    def close_dialog(self, dlg=None):
+        dlg = dlg or self.dialog
+        if dlg is not None:
+            try:
+                dlg.destroy()
+            except tk.TclError:
+                pass
+        if dlg is self.dialog:
+            self.dialog = None
+        # a tap on a dialog button can land on the map behind it
+        self.tap_guard = time.time() + 0.6
+
+    def grab(self, dlg):
+        try:
+            dlg.grab_set()
+        except tk.TclError:
+            pass
+
+    def ask_hero(self, default, done):
+        """Character creation: a name and a class. The dialog carries on
+        from its own buttons, calling done((name, class)), or done(None) if
+        cancelled: on Android (Pydroid) wait_window doesn't wait."""
+        root = self.root
+        if not self.open_dialog():
+            return
+        dlg = self.dialog = tk.Toplevel(root, bg=PANEL, padx=18, pady=14)
+        dlg.title("A new hero")
+        dlg.transient(root)
+        dlg.resizable(False, False)
+        tk.Label(dlg, text="Who art thou, traveller?", bg=PANEL, fg=ACCENT,
+                 font=tkf(F("Helvetica", 16, "bold"))).pack(anchor="w")
+        row = tk.Frame(dlg, bg=PANEL)
+        row.pack(fill="x", pady=(10, 8))
+        tk.Label(row, text="Name:", bg=PANEL, fg=INK,
+                 font=tkf(F("Helvetica", 13))).pack(side="left")
+        name = tk.Entry(row, bg=LOG_BG, fg=INK, insertbackground=INK,
+                        font=tkf(F(*MONO)), width=20, highlightthickness=0)
+        name.insert(0, default)
+        name.pack(side="left", padx=8)
+        cls = tk.StringVar(value="Fighter")
+        for c, info in CLASSES.items():
+            tk.Radiobutton(dlg, text=c, variable=cls, value=c, bg=PANEL,
+                           fg=INK, selectcolor=LOG_BG, activebackground=PANEL,
+                           font=tkf(F("Helvetica", 13, "bold")),
+                           anchor="w").pack(fill="x")
+            tk.Label(dlg, text=info["desc"], bg=PANEL, fg=INK_DIM,
+                     wraplength=S(360), justify="left",
+                     font=tkf(F("Helvetica", 12))).pack(fill="x",
+                                                        padx=(26, 0))
+
+        def begin(_=None):
+            n = name.get()
+            self.close_dialog(dlg)
+            done((n, cls.get()))
+
+        def cancel(_=None):
+            self.close_dialog(dlg)
+            done(None)
+        bar = tk.Frame(dlg, bg=PANEL)
+        bar.pack(fill="x", pady=(12, 0))
+        tk.Button(bar, text="Begin", command=begin, width=9,
+                  highlightbackground=PANEL).pack(side="right")
+        tk.Button(bar, text="Cancel", command=cancel, width=9,
+                  highlightbackground=PANEL).pack(side="right", padx=6)
+        dlg.bind("<Return>", begin)
+        dlg.bind("<Escape>", cancel)
+        dlg.protocol("WM_DELETE_WINDOW", cancel)
+        name.focus_set()
+        name.select_range(0, "end")
+        self.fit_dialog(dlg)
+        dlg.update_idletasks()
+        dlg.geometry("+%d+%d" % (
+            root.winfo_rootx() + max(0, (root.winfo_width() -
+                                         dlg.winfo_reqwidth()) // 2),
+            root.winfo_rooty() + max(0, min(80, (root.winfo_height() -
+                                                 dlg.winfo_reqheight()) //
+                                            2))))
+        self.grab(dlg)
+
+    def dialog_shrunk(self):
+        """Whether a dialog has the fonts shrunk to fit: leave them be."""
+        return self.small_dialog is not None
+
+    def fit_dialog(self, dlg):
+        """Shrink a dialog that's too big for the window until it fits;
+        everything goes back to its usual size when it closes."""
+        root = self.root
+        root.update_idletasks()
+        self.game.fit()
+        W, H = root.winfo_width(), root.winfo_height()
+        if W < 100:
+            return
+        shrunk = False
+        for _ in range(5):
+            dlg.update_idletasks()
+            k = min(1.0, (W - 8) / max(1, dlg.winfo_reqwidth()),
+                    (H - 8) / max(1, dlg.winfo_reqheight()))
+            if k >= 1.0:
+                break
+            shrunk = True
+            set_fonts(UI[0] * k * 0.97)
+            todo = [dlg]
+            while todo:
+                w = todo.pop()
+                todo += w.winfo_children()
+                try:
+                    wl = int(w.cget("wraplength"))
+                except (tk.TclError, ValueError):
+                    continue
+                if wl:
+                    w.configure(wraplength=max(60, int(wl * k)))
+        if shrunk:
+            self.small_dialog = dlg
+
+            def closed(e):
+                if e.widget is dlg:
+                    self.small_dialog = None
+                    self.root.after_idle(self.game.fit, True)
+            dlg.bind("<Destroy>", closed, add="+")
+
+    # The rest.
+
+    def set_icon(self):
+        set_window_icon(self.root)
+
+    def run(self):
+        self.root.mainloop()
+
+    def close(self):
+        self.root.destroy()
+
+
+# ── The display layer, in Kivy ──────────────────────────────────────────────
+# The same shell and screen again, for Kivy: run with --kivy (or
+# PENULTIMATE_UI=kivy) where Kivy is installed; a Python without Tk (the
+# Android app --build-android makes) uses Kivy by itself.  Kivy is only
+# looked for when asked, and by names put together at run time, as for the
+# mixer: Pydroid picks how to run a script from what it imports, and the
+# game itself must still start with Tk.  Kivy counts in real pixels from
+# the bottom left; these classes turn that into the map's pixels from its
+# top left.
+
+KV = {}             # Kivy's parts, once loaded
+
+
+def load_kivy(width=980, height=720):
+    """Kivy's classes, by name; the first call opens the window."""
+    if KV:
+        return KV
+    os.environ.setdefault("KIVY_NO_ARGS", "1")      # --kivy is ours
+    os.environ.setdefault("KIVY_NO_CONSOLELOG", "1")
+    import importlib
+    k = "ki" + "vy"
+
+    def part(module, *names):
+        mod = importlib.import_module(k + module)
+        for n in names:
+            KV[n] = getattr(mod, n)
+    config = importlib.import_module(k + ".config").Config
+    config.set("kivy", "exit_on_escape", "0")       # Escape and Back: ours
+    config.set("kivy", "log_level", "warning")
+    # A touch can come twice, from the touch screen and again as a mouse:
+    # on a phone there's no mouse to want, and elsewhere the mouse gives
+    # way while the touch screen is in use.
+    if ANDROID:
+        config.remove_option("input", "mouse")
+    else:
+        config.set("input", "mouse",
+                   "mouse,disable_multitouch,disable_on_activity")
+    config.set("graphics", "width", str(width))
+    config.set("graphics", "height", str(height))
+    part(".core.window", "Window")
+    part(".app", "App")
+    part(".clock", "Clock")
+    part(".graphics", "Color", "Rectangle", "Line", "InstructionGroup")
+    part(".graphics.texture", "Texture")
+    part(".core.text.markup", "MarkupLabel")
+    part(".uix.widget", "Widget")
+    part(".uix.stencilview", "StencilView")
+    part(".uix.boxlayout", "BoxLayout")
+    part(".uix.gridlayout", "GridLayout")
+    part(".uix.label", "Label")
+    part(".uix.button", "Button")
+    part(".uix.togglebutton", "ToggleButton")
+    part(".uix.textinput", "TextInput")
+    part(".uix.scrollview", "ScrollView")
+    part(".uix.modalview", "ModalView")
+    return KV
+
+
+def kivy_rgba(colour, alpha=1.0):
+    """A Tk colour ("#rrggbb", "black" or "white") as Kivy's (r, g, b, a)."""
+    colour = {"black": "#000000", "white": "#ffffff"}.get(colour, colour)
+    return (int(colour[1:3], 16) / 255, int(colour[3:5], 16) / 255,
+            int(colour[5:7], 16) / 255, alpha)
+
+
+def kivy_markup(text, mono_px=None):
+    """Print for a Kivy label that reads markup: [, ] and & kept as they
+    are, and the symbols Kivy's Roboto fonts lack (the menus' arrows) set
+    in DejaVu Sans, which Kivy also brings, smaller in monospaced print of
+    mono_px pixels so that the columns still line up."""
+    if mono_px:
+        start = "[font=DejaVuSans][size=%d]" % max(6, round(mono_px * 0.72))
+        end = "[/size][/font]"
+    else:
+        start, end = "[font=DejaVuSans]", "[/font]"
+    out, run = [], []
+    for ch in text:
+        if ord(ch) > 0xff and not 0x2010 <= ord(ch) <= 0x2027:
+            run.append(ch)
+            continue
+        if run:
+            out.append(start + "".join(run) + end)
+            run = []
+        out.append({"&": "&amp;", "[": "&bl;", "]": "&br;"}.get(ch, ch))
+    if run:
+        out.append(start + "".join(run) + end)
+    return "".join(out)
+
+
+class KivyFonts:
+    """F()'s fonts in Kivy's terms: Roboto for print, Roboto Mono where the
+    columns must line up, at a size in real pixels."""
+    pt = 4 / 3          # as Tk counts pixels to a point on a desktop: on
+                        # a phone too, so print keeps to the layout's size
+
+    @classmethod
+    def px(cls, size):
+        return max(6, round(size * UI[0] * cls.pt))
+
+    @staticmethod
+    def mono(font):
+        return font[0] in ("Menlo", "Courier")
+
+    @classmethod
+    def markup(cls, text, font):
+        return kivy_markup(text, cls.px(font[1]) if cls.mono(font) else None)
+
+    @classmethod
+    def options(cls, font):
+        family, size, style = font
+        return {"font_name": "RobotoMono-Regular" if cls.mono(font)
+                else "Roboto", "font_size": cls.px(size),
+                "bold": "bold" in style, "italic": "italic" in style}
+
+
+def png_pixels(data):
+    """An 8-bit RGBA PNG (as make_tiles.py writes them) as (width, height,
+    its RGBA bytes, top row first)."""
+    b = base64.b64decode(data)
+    pos, idat, w, h = 8, [], 0, 0
+    while pos < len(b):
+        n, tag = struct.unpack(">I4s", b[pos:pos + 8])
+        body = b[pos + 8:pos + 8 + n]
+        if tag == b"IHDR":
+            w, h, depth, kind, _, _, laced = struct.unpack(">IIBBBBB", body)
+            if (depth, kind, laced) != (8, 6, 0):
+                raise ValueError("not an 8-bit RGBA PNG")
+        elif tag == b"IDAT":
+            idat.append(body)
+        pos += 12 + n
+    raw = zlib.decompress(b"".join(idat))
+    stride = w * 4
+    out, prev, i = bytearray(), bytearray(stride), 0
+    for _ in range(h):
+        kind, line = raw[i], bytearray(raw[i + 1:i + 1 + stride])
+        i += 1 + stride
+        for x in range(stride):
+            a = line[x - 4] if x >= 4 else 0
+            up = prev[x]
+            if kind == 1:
+                line[x] = (line[x] + a) & 255
+            elif kind == 2:
+                line[x] = (line[x] + up) & 255
+            elif kind == 3:
+                line[x] = (line[x] + (a + up) // 2) & 255
+            elif kind == 4:
+                c = prev[x - 4] if x >= 4 else 0
+                p = a + up - c
+                pa, pb, pc = abs(p - a), abs(p - up), abs(p - c)
+                line[x] = (line[x] + (a if pa <= pb and pa <= pc else
+                                      up if pb <= pc else c)) & 255
+        out += line
+        prev = line
+    return w, h, bytes(out)
+
+
+class KivyScreen:
+    """The map in Kivy: a widget whose canvas holds, from the bottom, the
+    tiles, the overlay and the two sprites."""
+    ANCHOR_X = {"w": 0, "e": 1}
+    ANCHOR_Y = {"n": 0, "s": 1}
+
+    def __init__(self):
+        kv = load_kivy()
+        self.kv = kv
+        screen = self
+        self.game = None
+
+        class MapArea(kv["StencilView"]):     # (drawing kept inside it)
+            def on_touch_down(self, touch):
+                if getattr(touch, "is_mouse_scrolling", False) or \
+                        not self.collide_point(*touch.pos) or \
+                        screen.game is None:
+                    return super().on_touch_down(touch)
+                x, y = int(touch.x - self.x), int(self.top - touch.y)
+                if not screen.echo(x, y):
+                    screen.game.tapped(Tap(x, y))
+                return True
+        self.widget = MapArea()
+        with self.widget.canvas.before:
+            kv["Color"](0, 0, 0, 1)
+            bg = kv["Rectangle"]()
+        self.widget.bind(pos=lambda w, v: setattr(bg, "pos", v),
+                         size=lambda w, v: setattr(bg, "size", v))
+        self.groups = {}
+        for layer in ("grid", "overlay", "sprites"):
+            g = self.groups[layer] = kv["InstructionGroup"]()
+            self.widget.canvas.add(g)
         self.cells = []
+        self.sprites = {}
+        self.ts = 16
+        self.last_tap = (0, -999, -999)
+        self.labels = {}            # (text, font, ...) -> texture
+
+    def echo(self, x, y):
+        """Whether a tap at x, y is the last one over again: the same
+        place within a third of a second, as when one touch reaches Kivy
+        twice.  Answered for real, it could undo the first (opening a menu,
+        then closing it)."""
+        t, lx, ly = self.last_tap
+        now = time.time()
+        self.last_tap = (now, x, y)
+        half = max(8, self.ts // 2)
+        return now - t < 0.3 and abs(x - lx) < half and abs(y - ly) < half
+
+    def kx(self, x):
+        return self.widget.x + x
+
+    def ky(self, y, h=0):
+        """Kivy's y for the bottom of something h high whose top is at y."""
+        return self.widget.y + self.widget.height - y - h
+
+    def size(self):
+        return int(self.widget.width), int(self.widget.height)
+
+    def listen(self, game):
+        """The map resized or moved: lay the tiles out afresh."""
+        self.game = game
+        trigger = self.kv["Clock"].create_trigger(lambda dt: game.layout())
+        self.widget.bind(size=lambda *a: trigger(), pos=lambda *a: trigger())
+
+    # The tiles.
+
+    def texture(self, w, h, pixels):
+        """A texture of RGBA pixels, top row first, drawn sharp."""
+        tex = self.kv["Texture"].create(size=(w, h), colorfmt="rgba")
+        tex.mag_filter = tex.min_filter = "nearest"
+        stride = w * 4
+        flipped = b"".join(pixels[i:i + stride]
+                           for i in range((h - 1) * stride, -1, -stride))
+        tex.blit_buffer(flipped, colorfmt="rgba", bufferfmt="ubyte")
+        return tex
+
+    def load_tiles(self):
+        self.img, self.dimg, avg = {}, {}, {}
+        for name, data in TILE_PNG.items():
+            w, h, px = png_pixels("".join(data))
+            self.img[name] = self.texture(w, h, px)
+            if name.split("@")[0] in SPRITES:
+                continue
+            tot = [sum(px[c::4]) for c in range(3)]
+            dark = bytearray(px)
+            for i in range(len(dark)):
+                if i % 4 != 3:
+                    dark[i] = int(dark[i] * 0.38)
+            self.dimg[name] = self.texture(w, h, bytes(dark))
+            avg[name] = "#%02x%02x%02x" % tuple(v // (w * h) for v in tot)
+        return avg
+
+    def set_scale(self, s):
+        """(The textures are drawn at whatever size the squares are.)"""
+
+    def grid(self, cols, rows, ox, oy, ts):
+        kv = self.kv
+        for g in self.groups.values():
+            g.clear()
+        self.ts = ts
+        grid = self.groups["grid"]
+        grid.add(kv["Color"](1, 1, 1, 1))
+        self.cells = []
+        for j in range(rows):
+            for i in range(cols):
+                pos = (self.kx(ox + i * ts), self.ky(oy + j * ts, ts))
+                cell = (kv["Rectangle"](pos=pos, size=(0, 0)),
+                        kv["Rectangle"](pos=pos, size=(0, 0)))
+                grid.add(cell[0])
+                grid.add(cell[1])
+                self.cells.append(cell)
+        sprites = self.groups["sprites"]
+        sprites.add(kv["Color"](1, 1, 1, 1))
+        for which in ("fx", "missile"):
+            r = self.sprites[which] = kv["Rectangle"](size=(0, 0))
+            sprites.add(r)
+
+    def cell(self, idx, layer, name):
+        r = self.cells[idx][layer]
+        if name is None:
+            r.size = (0, 0)
+            return
+        r.texture = (self.dimg[name[1:]] if name[0] == "~"
+                     else self.img[name])
+        r.size = (self.ts, self.ts)
+
+    def sprite(self, which, x, y, name):
+        r = self.sprites.get(which)
+        if r is None:
+            return
+        if name is None:
+            r.size = (0, 0)
+            return
+        r.texture = self.img[name]
+        r.pos = (self.kx(x), self.ky(y, self.ts))
+        r.size = (self.ts, self.ts)
+
+    # Print.
+
+    def label(self, text, font, fill=None, justify="left"):
+        """A texture of print, kept for next time."""
+        key = (text, font, fill, justify, UI[0])
+        tex = self.labels.get(key)
+        if tex is None:
+            if len(self.labels) > 2000:
+                self.labels.clear()
+            lab = self.kv["MarkupLabel"](
+                text=KivyFonts.markup(text, font),
+                color=kivy_rgba(fill or INK), halign=justify,
+                **KivyFonts.options(font))
+            lab.refresh()
+            tex = self.labels[key] = lab.texture
+        return tex
+
+    def measure(self, font, s):
+        return self.label(s, font).width if s else 0
+
+    def linespace(self, font):
+        return self.label("Ag", font).height
+
+    def text_size(self, text, font):
+        tex = self.label(text, font)
+        return tex.width, tex.height
+
+    # The overlay.
+
+    def clear_overlay(self):
+        self.groups["overlay"].clear()
+
+    def add(self, colour, shape):
+        g = self.groups["overlay"]
+        g.add(self.kv["Color"](*kivy_rgba(colour)))
+        g.add(shape)
+
+    def rect(self, x0, y0, x1, y1, fill="", outline="", width=1):
+        kv = self.kv
+        x0, x1 = min(x0, x1), max(x0, x1)
+        y0, y1 = min(y0, y1), max(y0, y1)
+        pos, size = (self.kx(x0), self.ky(y1)), (x1 - x0, y1 - y0)
+        if fill:
+            self.add(fill, kv["Rectangle"](pos=pos, size=size))
+        if outline:
+            self.add(outline, kv["Line"](rectangle=pos + size,
+                                         width=max(1, width * 0.75)))
+
+    def text(self, x, y, text, font, fill, anchor="center", justify="left"):
+        if not text:
+            return
+        tex = self.label(text, font, fill, justify)
+        ax = 0.5 if anchor in ("center", "n", "s") else \
+            self.ANCHOR_X[anchor[-1]]
+        ay = 0.5 if anchor in ("center", "w", "e") else \
+            self.ANCHOR_Y[anchor[0]]
+        left, top = x - tex.width * ax, y - tex.height * ay
+        g = self.groups["overlay"]
+        g.add(self.kv["Color"](1, 1, 1, 1))
+        g.add(self.kv["Rectangle"](texture=tex, size=tex.size,
+                                   pos=(self.kx(left),
+                                        self.ky(top, tex.height))))
+
+    def map_image(self, rows, z, x, y):
+        w, h = len(rows[0]), len(rows)
+        px = bytearray()
+        for row in rows:
+            for c in row:
+                px += bytes((int(c[1:3], 16), int(c[3:5], 16),
+                             int(c[5:7], 16), 255))
+        tex = self.texture(w, h, bytes(px))
+        g = self.groups["overlay"]
+        g.add(self.kv["Color"](1, 1, 1, 1))
+        g.add(self.kv["Rectangle"](texture=tex, size=(w * z, h * z),
+                                   pos=(self.kx(x), self.ky(y, h * z))))
+
+
+KIVY_KEYS = {273: "Up", 274: "Down", 276: "Left", 275: "Right",
+             13: "Return", 271: "KP_Enter", 27: "Escape", 32: "space",
+             9: "Tab", 8: "BackSpace", 269: "KP_Subtract", 270: "KP_Add",
+             282: "F1"}
+KIVY_KEYS.update({256 + n: "KP_%d" % n for n in range(10)})
+KIVY_CHARS = {"+": "plus", "-": "minus", "=": "equal", "?": "question",
+              "/": "slash", ".": "period", "_": "underscore"}
+
+
+class KivyShell:
+    """The window round the map, in Kivy: the same bars, panel, log, entry
+    and buttons as the Tk one, and Kivy's clock and keys."""
+
+    def __init__(self):
+        self.kv = load_kivy()
+        self.fonts = []             # (widget, font): resized together
+        self.raw = {}               # label -> its text, before markup
+        self.log_lines = []
+        self.entry_shown = False
+        self.dialog = None
+        self.tap_guard = 0
+        self.app = None
+
+    def screen_height(self):
+        return self.kv["Window"].height
+
+    def window_size(self):
+        return tuple(int(v) for v in self.kv["Window"].size)
+
+    def set_ui_scale(self, u):
+        UI[0] = u
+        for w, font in self.fonts:
+            w.font_size = KivyFonts.px(font[1])
+            if w in self.raw:
+                w.text = KivyFonts.markup(self.raw[w], font)
+        self.screen.labels.clear()
+        self.show_log()
+
+    # Building.
+
+    def painted(self, widget, colour):
+        """A widget with a background."""
+        kv = self.kv
+        with widget.canvas.before:
+            kv["Color"](*kivy_rgba(colour))
+            r = kv["Rectangle"](pos=widget.pos, size=widget.size)
+        widget.bind(pos=lambda w, v: setattr(r, "pos", v),
+                    size=lambda w, v: setattr(r, "size", v))
+        return widget
+
+    def label(self, font, colour, wrap=False, **kw):
+        lab = self.kv["Label"](markup=True, color=kivy_rgba(colour),
+                               halign="left", valign="top",
+                               **dict(KivyFonts.options(font), **kw))
+        self.fonts.append((lab, font))
+        if wrap:
+            lab.size_hint_y = None
+            lab.height = 0
+            lab.bind(texture_size=lambda w, v: setattr(w, "height", v[1]))
+        else:
+            lab.size_hint = (None, None)
+            lab.bind(texture_size=lambda w, v: setattr(w, "size", v))
+        return lab
+
+    def button(self, text, command, font=None, cls="Button", **kw):
+        font = font or F("Helvetica", 13)
+        b = self.kv[cls](text=text, font_size=KivyFonts.px(font[1]),
+                         bold="bold" in font[2], **kw)
+        self.fonts.append((b, font))
+        if command:
+            b.bind(on_release=lambda w: command())
+        return b
+
+    def build(self, game, buttons, big):
+        kv = self.kv
+        self.game = game
+        if not ANDROID:
+            kv["Window"].system_size = (1180, 860) if big else (980, 720)
+        kv["Window"].clearcolor = kivy_rgba(PANEL)
+        self.root = self.painted(kv["BoxLayout"](orientation="vertical"),
+                                 PANEL)
+        top = self.top = kv["BoxLayout"](size_hint_y=None, height=S(30),
+                                         padding=(S(10), S(6)),
+                                         spacing=S(20))
+        top.add_widget(self.label(F("Helvetica", 16, "bold"), ACCENT,
+                                  text="Penultimate"))
+        self.status = self.label(F("Helvetica", 12), INK_DIM)
+        top.add_widget(self.status)
+        top.add_widget(kv["Widget"]())
+        self.turns = self.label(F("Helvetica", 12), INK_DIM)
+        top.add_widget(self.turns)
+        self.root.add_widget(top)
+
+        self.body = kv["BoxLayout"]()
+        self.left = kv["BoxLayout"](orientation="vertical")
+        self.screen = KivyScreen()
+        self.left.add_widget(self.screen.widget)
+        self.log_view = self.painted(kv["ScrollView"](
+            size_hint_y=None, height=S(100), do_scroll_x=False,
+            bar_width=S(4)), LOG_BG)
+        self.log = self.label(F(*MONO), INK, wrap=True,
+                              padding=(S(8), S(4)))
+        self.log.bind(width=lambda w, v: setattr(w, "text_size", (v, None)))
+        self.log_view.add_widget(self.log)
+        self.left.add_widget(self.log_view)
+        self.talkbar = self.painted(kv["BoxLayout"](
+            size_hint_y=None, height=S(34), padding=(S(8), S(4)),
+            spacing=S(6)), PANEL)
+        self.prompt = self.label(F(*MONO), ACCENT, text="Your interest:")
+        self.talkbar.add_widget(self.prompt)
+        self.entry = kv["TextInput"](
+            multiline=False, write_tab=False, text_validate_unfocus=False,
+            background_color=kivy_rgba(LOG_BG),
+            foreground_color=kivy_rgba(INK), cursor_color=kivy_rgba(INK),
+            **{k: v for k, v in KivyFonts.options(F(*MONO)).items()
+               if k in ("font_name", "font_size")})
+        self.fonts.append((self.entry, F(*MONO)))
+        self.entry.bind(on_text_validate=lambda *a: game.on_entry())
+        self.talkbar.add_widget(self.entry)
+        if ANDROID:                 # the keyboard mustn't hide what's typed
+            kv["Window"].softinput_mode = "below_target"
+        self.body.add_widget(self.left)
+
+        self.side = kv["BoxLayout"](orientation="vertical",
+                                    size_hint_x=None, width=S(230),
+                                    padding=(S(10), S(8)), spacing=S(4))
+        self.panelrow = kv["BoxLayout"](size_hint_y=None, height=0,
+                                        spacing=S(10))
+        self.panel = self.label(F(*MONO), INK, wrap=True)
+        self.panel2 = self.label(F(*MONO), INK, wrap=True)
+        for p in (self.panel, self.panel2):
+            p.bind(texture_size=lambda w, v: self.fit_panel())
+        self.panelrow.add_widget(self.panel)
+        self.condition = self.label(F("Menlo", 12, "bold"), BAD, wrap=True)
+        self.side.add_widget(self.panelrow)
+        self.side.add_widget(self.condition)
+        self.spacer = kv["Widget"]()        # (wide: the rest of the height)
+        self.side.add_widget(self.spacer)
+        self.body.add_widget(self.side)
+        self.root.add_widget(self.body)
+
+        self.bar = kv["GridLayout"](size_hint_y=None, height=S(40),
+                                    padding=S(2), spacing=S(4))
+        self.btn = {}
+        for key, label, cmd in buttons:
+            self.btn[key] = b = self.button(label, cmd)
+            self.bar.add_widget(b)
+        self.root.add_widget(self.bar)
+        self.listen(game)
+        self.screen.listen(game)
+        return self.screen
+
+    def fit_panel(self):
+        self.panelrow.height = max(self.panel.height, self.panel2.height
+                                   if self.panel2.parent else 0)
+
+    def arrange(self, tall, W):
+        """Wide: the panel at the side, the buttons in a row; tall (a phone
+        held upright): the panel underneath, the buttons in rows."""
+        lh = self.screen.linespace(F(*MONO))
+        self.top.height = self.screen.linespace(
+            F("Helvetica", 16, "bold")) + S(12)
+        self.talkbar.height = lh + S(14)
+        self.log_view.height = lh * (5 if tall else 7) + S(8)
+        each = max(self.screen.measure(F("Helvetica", 13), b.text)
+                   for b in self.btn.values()) + S(28)
+        n = len(self.btn)
+        rows = 2 if tall else 1
+        while rows < n and -(-n // rows) * each > W:
+            rows += 1
+        self.bar.cols = -(-n // rows)
+        self.bar.height = rows * (lh + S(22)) + S(4)
+        self.body.remove_widget(self.side)
+        if tall:
+            self.body.orientation = "vertical"
+            self.side.size_hint = (1, None)
+            self.spacer.size_hint_y = None
+            self.spacer.height = 0
+            self.side.bind(minimum_height=self.side.setter("height"))
+            self.side.height = self.side.minimum_height
+            wrap_ = (W - S(50)) // 2
+        else:
+            self.body.orientation = "horizontal"
+            self.side.unbind(minimum_height=self.side.setter("height"))
+            self.side.size_hint = (None, 1)
+            self.side.width = S(230)
+            self.spacer.size_hint_y = 1
+            wrap_ = S(210)
+        self.body.add_widget(self.side)
+        for p in (self.panel, self.panel2):
+            p.text_size = (wrap_, None)
+        self.condition.text_size = (W - S(24) if tall else S(210), None)
+
+    # What the window shows round the map.
+
+    def set_label(self, label, text):
+        if self.raw.get(label) != text:
+            self.raw[label] = text
+            label.text = KivyFonts.markup(text, dict(self.fonts)[label])
+
+    def set_status(self, text):
+        self.set_label(self.status, text)
+
+    def set_clock(self, text):
+        self.set_label(self.turns, text)
+
+    def set_condition(self, text):
+        self.set_label(self.condition, text)
+
+    def set_panel(self, first, second=None):
+        self.set_label(self.panel, "\n".join(first))
+        if second is None:
+            if self.panel2.parent:
+                self.panelrow.remove_widget(self.panel2)
+        else:
+            self.set_label(self.panel2, "\n".join(second))
+            if not self.panel2.parent:
+                self.panelrow.add_widget(self.panel2)
+        self.fit_panel()
+
+    def log_add(self, text, tag=None):
+        self.log_lines = self.log_lines[-150:] + [(text, tag)]
+        self.show_log()
+
+    def show_log(self):
+        px = KivyFonts.px(MONO[1])
+        lines = []
+        for text, tag in self.log_lines:
+            line = "[color=%s]%s[/color]" % (LOG_TAGS.get(tag, INK),
+                                              kivy_markup(text, px))
+            lines.append("[b]%s[/b]" % line if tag == "quest" else line)
+        self.log.text = "\n".join(lines)
+        self.kv["Clock"].schedule_once(
+            lambda dt: setattr(self.log_view, "scroll_y", 0), 0)
+
+    def log_clear(self):
+        self.log_lines = []
+        self.log.text = ""
+
+    # The "Your interest:" entry.
+
+    def show_entry(self, focus):
+        self.prompt.text = "Your interest:"
+        self.entry.text = ""
+        if not self.entry_shown:
+            self.left.add_widget(self.talkbar)      # under the log
+            self.entry_shown = True
+        if focus:
+            self.entry.focus = True
+
+    def set_prompt(self, text):
+        self.prompt.text = text
+
+    def hide_entry(self):
+        if self.entry_shown:
+            self.entry.focus = False
+            self.left.remove_widget(self.talkbar)
+            self.entry_shown = False
+
+    def take_entry(self):
+        text, self.entry.text = self.entry.text, ""
+        return text
+
+    # Time.
+
+    def after(self, ms, fn, *args):
+        return self.kv["Clock"].schedule_once(lambda dt: fn(*args),
+                                              ms / 1000)
+
+    def after_idle(self, fn, *args):
+        return self.kv["Clock"].schedule_once(lambda dt: fn(*args), 0)
+
+    def cancel(self, job):
+        job.cancel()
+
+    # The hero dialog.
+
+    def ask_hero(self, default, done):
+        """Character creation, as the Tk dialog: a name and a class, then
+        done((name, class)), or done(None) if cancelled."""
+        if self.dialog is not None:
+            return
+        self.game.fit()             # (it may open before the first fit)
+        kv = self.kv
+        W, H = self.window_size()
+        width = min(W - S(16), S(470))
+        view = kv["ModalView"](size_hint=(None, None), auto_dismiss=False,
+                               width=width, background_color=(0, 0, 0, .6))
+        scroll = self.painted(kv["ScrollView"](do_scroll_x=False), PANEL)
+        box = kv["BoxLayout"](orientation="vertical", size_hint_y=None,
+                              padding=(S(18), S(14)), spacing=S(6))
+        box.bind(minimum_height=box.setter("height"))
+        inner = width - 2 * S(18)
+
+        def wrapped(text, font, colour, indent=0):
+            lab = self.label(font, colour, wrap=True, text=text,
+                             padding=(indent, 0))
+            lab.text_size = (inner, None)
+            return lab
+        box.add_widget(wrapped("Who art thou, traveller?",
+                               F("Helvetica", 16, "bold"), ACCENT))
+        row = kv["BoxLayout"](size_hint_y=None, spacing=S(8),
+                              height=self.screen.linespace(F(*MONO)) + S(16))
+        row.add_widget(self.label(F("Helvetica", 13), INK, text="Name:"))
+        name = kv["TextInput"](
+            text=default, multiline=False, write_tab=False,
+            background_color=kivy_rgba(LOG_BG),
+            foreground_color=kivy_rgba(INK), cursor_color=kivy_rgba(INK),
+            **{k: v for k, v in KivyFonts.options(F(*MONO)).items()
+               if k in ("font_name", "font_size")})
+        row.add_widget(name)
+        box.add_widget(row)
+        picks = {}
+        bh = self.screen.linespace(F("Helvetica", 13, "bold")) + S(14)
+        for c, info in CLASSES.items():
+            b = picks[c] = self.button(
+                c, None, F("Helvetica", 13, "bold"), "ToggleButton",
+                group="penultimate-class", allow_no_selection=False,
+                state="down" if c == "Fighter" else "normal",
+                size_hint_y=None, height=bh)
+            box.add_widget(b)
+            box.add_widget(wrapped(info["desc"], F("Helvetica", 12),
+                                   INK_DIM, S(10)))
+
+        def close():
+            self.fonts = [(w, f) for w, f in self.fonts
+                          if w not in widgets]
+            self.dialog = None
+            view.dismiss()
+            self.tap_guard = time.time() + 0.6
+
+        def begin(*_):
+            if self.dialog is None:
+                return
+            cls = next((c for c, b in picks.items() if b.state == "down"),
+                       "Fighter")
+            n = name.text
+            close()
+            done((n, cls))
+
+        def cancel(*_):
+            if self.dialog is None:
+                return
+            close()
+            done(None)
+        bar = kv["BoxLayout"](size_hint_y=None, height=bh, spacing=S(8))
+        bar.add_widget(kv["Widget"]())
+        bar.add_widget(self.button("Cancel", cancel, size_hint_x=None,
+                                   width=S(110)))
+        bar.add_widget(self.button("Begin", begin, size_hint_x=None,
+                                   width=S(110)))
+        box.add_widget(kv["Widget"](size_hint_y=None, height=S(6)))
+        box.add_widget(bar)
+        name.bind(on_text_validate=begin)
+        scroll.add_widget(box)
+        view.add_widget(scroll)
+        box.bind(height=lambda w, v: setattr(view, "height",
+                                             min(v, H - S(16))))
+        widgets = set()
+        todo = [view]
+        while todo:
+            w = todo.pop()
+            widgets.add(w)
+            todo += w.children
+        self.dialog = {"begin": begin, "cancel": cancel, "name": name}
+        view.open()
+        if not ANDROID:         # (no on-screen keyboard until it's tapped)
+            def focus(dt):
+                name.focus = True
+                name.select_all()
+            self.kv["Clock"].schedule_once(focus, 0.1)
+
+    def dialog_shrunk(self):
+        return False
+
+    # Keys, and the window.
+
+    def listen(self, game):
+        win = self.kv["Window"]
+
+        def key_down(window, key, scancode, codepoint, modifiers):
+            ctrl = "ctrl" in modifiers or "meta" in modifiers
+            if key == ord("q") and ctrl:
+                game.quit()
+                return True
+            d = self.dialog
+            if d is not None:
+                if key == 27:
+                    d["cancel"]()
+                elif key in (13, 271) and not d["name"].focus:
+                    d["begin"]()
+                return key == 27
+            if self.entry.focus:
+                if key == 27:
+                    game.end_talk()
+                    return True
+                return False            # typing a word to say
+            name = KIVY_KEYS.get(key)
+            if name is None and codepoint:
+                name = KIVY_CHARS.get(codepoint, codepoint)
+                if "shift" in modifiers and codepoint.isalpha():
+                    name = codepoint.upper()
+            if name is None:
+                return False
+            if name == "Escape" and game.talk:
+                game.end_talk()         # (the Back button, on a phone)
+                return True
+            game.on_key(Key(name, (0x04 if ctrl else 0) |
+                            (0x08 if "alt" in modifiers else 0)))
+            return True
+        win.bind(on_key_down=key_down)
+        win.bind(on_resize=lambda *a: game.on_resize())
+        win.bind(on_request_close=lambda *a, **k: game.quit() or True)
+
+    def set_icon(self):
+        path = os.path.join(tempfile.gettempdir(), "penultimate-icon.png")
+        try:
+            with open(path, "wb") as f:
+                f.write(base64.b64decode(ICON_PNG))
+            self.kv["Window"].set_icon(path)
+        except OSError:
+            pass
+
+    def run(self):
+        root, game = self.root, self.game
+        Clock = self.kv["Clock"]
+
+        class Penultimate(self.kv["App"]):
+            title = "Penultimate"
+
+            def build(app):
+                return root
+
+            def on_start(app):
+                """Fit the window once it's up: a phone's comes up at its
+                size without ever being resized."""
+                Clock.schedule_once(lambda dt: game.fit(True), 0)
+
+            def on_pause(app):
+                """Switched away from: Android may close the app without
+                another word, so the game is saved now."""
+                game.save()
+                game.sound.stop_music()
+                return True
+
+            def on_resume(app):
+                game.sound.tick()
+        self.app = Penultimate()
+        self.app.run()
+
+    def close(self):
+        if self.app is not None:
+            self.app.stop()
+        else:
+            self.kv["Window"].close()
+
+
+class Game:
+    def __init__(self, shell):
+        """The game, in the window shell (a TkShell or a KivyShell) gives
+        it."""
+        self.shell = shell
+        self.sound = Sound()
+        saved = load_saved()
+        self.sound.muted = bool(saved.get("muted"))
+        self.sound.music_off = bool(saved.get("music_off"))
+        zoom = saved.get("zoom")
+        self.zoom_d = zoom if zoom in range(-2, 3) else 0
+        text = saved.get("text")
+        self.text_k = text if text in TEXT_SIZES else 1.0
+        self.scale = 3 if shell.screen_height() >= 1000 else 2
+        self.tall = None
+        self.fit_job = None
+        self.screen = shell.build(self, (
+            ("wait", "Wait", self.wait),
+            ("sling", "Sling", self.ready_sling),
+            ("cast", "Cast", self.choose_spell),
+            ("potion", "Potion", self.drink),
+            ("map", "Map", self.toggle_map),
+            ("phone", "Blueberry", self.blueberry),
+            ("menu", "Menu", self.action_menu)), self.scale >= 3)
+        self.load_images()
         self.shown = []
         self.frame = 0              # animation frame, 0 or 1
         self.view = (0, 0)
@@ -2101,19 +3372,11 @@ class Game:
         self.visible = set()
         self.cache = {}
 
-        self.canvas.bind("<Configure>", lambda e: self.layout())
-        root.bind("<Configure>", self.on_resize, add="+")
-        self.canvas.bind("<ButtonPress-1>", self.tapped)
-        root.bind("<KeyPress>", self.on_key)
-        for k in ("Control-q", "Command-q"):
-            root.bind("<%s>" % k, lambda e: self.quit())
-        root.protocol("WM_DELETE_WINDOW", self.quit)
-
         try:
             self.restore(saved["game"])
         except (KeyError, TypeError, ValueError, IndexError, zlib.error):
             # once the window is up, so the dialog can be fitted to it
-            self.root.after(50, self.new_game)
+            self.shell.after(50, self.new_game)
         self.music_tick()
         self.animate()
         self.pad = Gamepad()
@@ -2145,19 +3408,19 @@ class Game:
                         break
                 if held != self.pad_dir:
                     self.pad_hold(held)
-        self.root.after(30, self.pad_poll)
+        self.shell.after(30, self.pad_poll)
 
     def pad_hold(self, d):
         """A direction pressed (or let go): act now, then repeat while held."""
         self.pad_dir = d
         if d:
             self.pad_direction(d)
-            self.root.after(350, self.pad_repeat, d)
+            self.shell.after(350, self.pad_repeat, d)
 
     def pad_repeat(self, d):
         if self.pad_dir == d:
             self.pad_direction(d)
-            self.root.after(160, self.pad_repeat, d)
+            self.shell.after(160, self.pad_repeat, d)
 
     def pad_direction(self, d):
         self.walking = None
@@ -2209,19 +3472,18 @@ class Game:
     def animate(self):
         """Flip every animated square to its other frame, twice a second."""
         self.frame ^= 1
-        if self.cells and not self.overlay:
-            c = self.canvas
+        if self.shown and not self.overlay:
+            scr = self.screen
             for idx, (base, top) in enumerate(self.shown):
                 nb, nt = self.framed(base), self.framed(top)
                 if (nb, nt) == (base, top):
                     continue
                 self.shown[idx] = (nb, nt)
-                bid, tid = self.cells[idx]
                 if nb != base:
-                    c.itemconfig(bid, image=self.img[nb])
+                    scr.cell(idx, 0, nb)
                 if nt != top:
-                    c.itemconfig(tid, image=self.img[nt])
-        self.root.after(450, self.animate)
+                    scr.cell(idx, 1, nt)
+        self.shell.after(450, self.animate)
 
     def framed(self, name):
         """The current animation frame of a tile name (None and remembered
@@ -2233,42 +3495,16 @@ class Game:
 
     def music_tick(self):
         self.sound.tick()
-        self.root.after(100, self.music_tick)
+        self.shell.after(100, self.music_tick)
 
     # ── Images ──
 
     def load_images(self):
-        """16px tiles from TILE_PNG, plus darkened copies of the terrain (for
-        remembered dungeon squares) and an average colour for the map."""
-        self.base, self.dark, self.avg = {}, {}, {}
-        for name, data in TILE_PNG.items():
-            img = tk.PhotoImage(data="".join(data))
-            self.base[name] = img
-            if name.split("@")[0] in SPRITES:
-                continue
-            rows, tot = [], [0, 0, 0]
-            for y in range(16):
-                row = []
-                for x in range(16):
-                    c = img.get(x, y)
-                    if isinstance(c, str):
-                        c = tuple(int(v) for v in c.split())
-                    for i in range(3):
-                        tot[i] += c[i]
-                    row.append("#%02x%02x%02x" % tuple(int(v * 0.38)
-                                                       for v in c[:3]))
-                rows.append("{" + " ".join(row) + "}")
-            dark = tk.PhotoImage(width=16, height=16)
-            dark.put(" ".join(rows))
-            self.dark[name] = dark
-            self.avg[name] = "#%02x%02x%02x" % tuple(v // 256 for v in tot)
-        self.scale_images()
-
-    def scale_images(self):
-        s = self.scale
-        self.img = {n: i.zoom(s) for n, i in self.base.items()}
-        self.animated = {n for n in self.img if n + "@1" in self.img}
-        self.dimg = {n: i.zoom(s) for n, i in self.dark.items()}
+        """The tiles, darkened copies of the terrain (for remembered
+        dungeon squares) and an average colour of each for the map."""
+        self.avg = self.screen.load_tiles()
+        self.animated = {n for n in TILE_PNG if n + "@1" in TILE_PNG}
+        self.screen.set_scale(self.scale)
 
     # ── Game setup ──
 
@@ -2282,99 +3518,20 @@ class Game:
         """A tap on the map, unless it's the tail of one on a dialog that
         just closed (on Android it can land on the map behind), or there's
         no game yet."""
-        if time.time() < getattr(self, "tap_guard", 0) or \
+        if time.time() < self.shell.tap_guard or \
                 not getattr(self, "area", None):
             return
         self.on_tap(ev)
 
-    def open_dialog(self):
-        """Whether a dialog can open now (only one at a time)."""
-        dlg = getattr(self, "dialog", None)
-        try:
-            if dlg is not None and dlg.winfo_exists():
-                dlg.lift()
-                return False
-        except tk.TclError:
-            pass
-        return True
-
-    def close_dialog(self, dlg=None):
-        dlg = dlg or getattr(self, "dialog", None)
-        if dlg is not None:
-            try:
-                dlg.destroy()
-            except tk.TclError:
-                pass
-        if dlg is getattr(self, "dialog", None):
-            self.dialog = None
-        # a tap on a dialog button can land on the map behind it
-        self.tap_guard = time.time() + 0.6
-
-    def grab(self, dlg):
-        try:
-            dlg.grab_set()
-        except tk.TclError:
-            pass
-
     def ask_hero(self, done):
-        """Character creation: a name and a class. The dialog carries on
-        from its own buttons, calling done((name, class)), or done(None) if
-        cancelled: on Android (Pydroid) wait_window doesn't wait."""
-        root = self.root
-        if not self.open_dialog():
-            return
-        dlg = self.dialog = tk.Toplevel(root, bg=PANEL, padx=18, pady=14)
-        dlg.title("A new hero")
-        dlg.transient(root)
-        dlg.resizable(False, False)
-        tk.Label(dlg, text="Who art thou, traveller?", bg=PANEL, fg=ACCENT,
-                 font=F("Helvetica", 16, "bold")).pack(anchor="w")
-        row = tk.Frame(dlg, bg=PANEL)
-        row.pack(fill="x", pady=(10, 8))
-        tk.Label(row, text="Name:", bg=PANEL, fg=INK,
-                 font=F("Helvetica", 13)).pack(side="left")
-        name = tk.Entry(row, bg=LOG_BG, fg=INK, insertbackground=INK,
-                        font=F(*MONO), width=20, highlightthickness=0)
-        name.insert(0, getattr(self, "p", START_PLAYER)["name"])
-        name.pack(side="left", padx=8)
-        cls = tk.StringVar(value="Fighter")
-        for c, info in CLASSES.items():
-            tk.Radiobutton(dlg, text=c, variable=cls, value=c, bg=PANEL,
-                           fg=INK, selectcolor=LOG_BG, activebackground=PANEL,
-                           font=F("Helvetica", 13, "bold"),
-                           anchor="w").pack(fill="x")
-            tk.Label(dlg, text=info["desc"], bg=PANEL, fg=INK_DIM,
-                     wraplength=S(360), justify="left",
-                     font=F("Helvetica", 12)).pack(fill="x", padx=(26, 0))
-
-        def begin(_=None):
-            n = " ".join(name.get().split())[:20]
-            self.close_dialog(dlg)
-            done((n or "Avatar", cls.get()))
-
-        def cancel(_=None):
-            self.close_dialog(dlg)
-            done(None)
-        bar = tk.Frame(dlg, bg=PANEL)
-        bar.pack(fill="x", pady=(12, 0))
-        tk.Button(bar, text="Begin", command=begin, width=9,
-                  highlightbackground=PANEL).pack(side="right")
-        tk.Button(bar, text="Cancel", command=cancel, width=9,
-                  highlightbackground=PANEL).pack(side="right", padx=6)
-        dlg.bind("<Return>", begin)
-        dlg.bind("<Escape>", cancel)
-        dlg.protocol("WM_DELETE_WINDOW", cancel)
-        name.focus_set()
-        name.select_range(0, "end")
-        self.fit_dialog(dlg)
-        dlg.update_idletasks()
-        dlg.geometry("+%d+%d" % (
-            root.winfo_rootx() + max(0, (root.winfo_width() -
-                                         dlg.winfo_reqwidth()) // 2),
-            root.winfo_rooty() + max(0, min(80, (root.winfo_height() -
-                                                 dlg.winfo_reqheight()) //
-                                            2))))
-        self.grab(dlg)
+        """Character creation: a name and a class, from the shell's dialog,
+        which calls done((name, class)), or done(None) if cancelled."""
+        def chosen(hero):
+            if hero is not None:
+                name, cls = hero
+                hero = (" ".join(name.split())[:20] or "Avatar", cls)
+            done(hero)
+        self.shell.ask_hero(getattr(self, "p", START_PLAYER)["name"], chosen)
 
     def new_game(self, hero=None):
         if hero is None:
@@ -2414,9 +3571,7 @@ class Game:
         self.aim = None
         self.menu = None
         self.walking = None
-        self.log.config(state="normal")
-        self.log.delete("1.0", "end")
-        self.log.config(state="disabled")
+        self.shell.log_clear()
         self.say("Welcome to %s, %s the %s!" % (
             self.world["realm"], self.p["name"], cls), "quest")
         self.say("Lord Canadian's castle stands beside thee. Walk into it "
@@ -2478,7 +3633,7 @@ class Game:
     def quit(self):
         self.save()
         self.sound.stop_music()
-        self.root.destroy()
+        self.shell.close()
 
     # ── Areas ──
 
@@ -2546,13 +3701,7 @@ class Game:
     # ── Messages ──
 
     def say(self, text, tag=None):
-        self.log.config(state="normal")
-        self.log.insert("end", text + "\n", tag or ())
-        n = int(self.log.index("end").split(".")[0])
-        if n > 500:
-            self.log.delete("1.0", "%d.0" % (n - 400))
-        self.log.config(state="disabled")
-        self.log.see("end")
+        self.shell.log_add(text, tag)
 
     def max_hp(self):
         return min(BEAVER_HP, self.p["maxhp"]) if self.p["beaver"] \
@@ -2568,9 +3717,12 @@ class Game:
     # ── Turns ──
 
     def on_key(self, ev):
+        k = ev.keysym
+        if self.talk and k == "Escape":
+            self.end_talk()
+            return
         if self.talk or self.busy or ev.state & 0x0C:
             return
-        k = ev.keysym
         self.walking = None
         if self.menu:
             k = k[3:] if k.startswith("KP_") else k
@@ -3025,12 +4177,12 @@ class Game:
                 self.held.append(mob.dungeon)
                 self.say("You recover %s! Return it to Lord Canadian."
                          % d["artifact"], "quest")
-                self.root.after(400, self.sound.play, "quest")
+                self.shell.after(400, self.sound.play, "quest")
             elif mob.kind == "moosedain":
                 self.flags.add("moosedain_dead")
                 self.say("Moosedain the Wicked is no more! Hasten back to "
                          "Lord Canadian with the news.", "quest")
-                self.root.after(400, self.sound.play, "quest")
+                self.shell.after(400, self.sound.play, "quest")
             self.save()
 
     def monster_attack(self, mob):
@@ -3088,7 +4240,7 @@ class Game:
         self.render()
         self.say("You have died...", "bad")
         self.sound.play("death")
-        self.root.after(1800, self.revive)
+        self.shell.after(1800, self.revive)
 
     def resurrect(self):
         p = self.p
@@ -3172,18 +4324,19 @@ class Game:
             m["cancel"]()
 
     def draw_menu(self):
-        c, m = self.canvas, self.menu
-        W, H = c.winfo_width(), c.winfo_height()
+        scr, m = self.screen, self.menu
+        W, H = scr.size()
         size = 16 if ANDROID else 14
         f, bold = F("Helvetica", size), F("Helvetica", size, "bold")
-        rh = f.metrics("linespace") + S(16 if ANDROID else 10)
+        rh = scr.linespace(f) + S(16 if ANDROID else 10)
         labels = [label for label, _ in m["items"]]
         title = m["title"]
-        bw = min(W - 20, max([f.measure(t) for t in labels] +
-                             [bold.measure(title)]) + 40)
-        if bold.measure(title) > bw - 40:
+        tw = scr.measure(bold, title)
+        bw = min(W - 20, max([scr.measure(f, t) for t in labels] +
+                             [tw]) + 40)
+        if tw > bw - 40:
             title = "\n".join(wrap(title, max(20, len(title) * (bw - 40) //
-                                              bold.measure(title))))
+                                              tw)))
         th = (title.count("\n") + 1) * rh
         fit = max(1, (H - 2 * rh - th) // rh)
         n_items = len(labels)
@@ -3201,25 +4354,20 @@ class Game:
                   else ""), (n_items - 1, labels[-1])]
         bh = len(shown) * rh + th + 16
         x0, y0 = (W - bw) // 2, max(8, (H - bh) // 2)
-        c.create_rectangle(x0, y0, x0 + bw, y0 + bh, fill=PANEL,
-                           outline=ACCENT, width=2, tags="overlay")
-        c.create_text(x0 + 20, y0 + 8 + th // 2, text=title, anchor="w",
-                      fill=ACCENT, font=bold, tags="overlay")
+        scr.rect(x0, y0, x0 + bw, y0 + bh, fill=PANEL, outline=ACCENT,
+                 width=2)
+        scr.text(x0 + 20, y0 + 8 + th // 2, title, bold, ACCENT, anchor="w")
         self.menu_rows = []
         for n, (i, label) in enumerate(shown):
             ry = y0 + 8 + th + n * rh
             if i == m["sel"]:
-                c.create_rectangle(x0 + 6, ry, x0 + bw - 6, ry + rh,
-                                   fill="#3a2f1c", outline="",
-                                   tags="overlay")
+                scr.rect(x0 + 6, ry, x0 + bw - 6, ry + rh, fill="#3a2f1c")
             if isinstance(i, str):
                 if label:
-                    c.create_text(x0 + bw // 2, ry + rh // 2, text=label,
-                                  fill=ACCENT, font=f, tags="overlay")
+                    scr.text(x0 + bw // 2, ry + rh // 2, label, f, ACCENT)
                     self.menu_rows.append((x0, ry, x0 + bw, ry + rh, i))
                 continue
-            c.create_text(x0 + 20, ry + rh // 2, text=label, anchor="w",
-                          fill=INK, font=f, tags="overlay")
+            scr.text(x0 + 20, ry + rh // 2, label, f, INK, anchor="w")
             self.menu_rows.append((x0, ry, x0 + bw, ry + rh, i))
 
     def on_tap(self, ev):
@@ -3323,7 +4471,7 @@ class Game:
             self.walking = None       # blocked, or something to deal with
             return
         if self.walking:
-            self.root.after(110, self.walk_step)
+            self.shell.after(110, self.walk_step)
 
     def wait(self):
         if self.busy or self.talk or self.overlay or self.menu:
@@ -3483,17 +4631,14 @@ class Game:
     def fly(self, path, tile, done):
         """Animate a missile along path, then call done."""
         cols, rows, ox, oy, ts = self.view
-        c = self.canvas
         if not path:
-            c.itemconfig(self.missile, state="hidden")
+            self.screen.sprite("missile", 0, 0, None)
             done()
             return
         x, y = path[0]
         i, j = x - self.pos[0] + cols // 2, y - self.pos[1] + rows // 2
-        c.coords(self.missile, ox + i * ts, oy + j * ts)
-        c.itemconfig(self.missile, image=self.img[tile], state="normal")
-        c.tag_raise(self.missile)
-        self.root.after(35, self.fly, path[1:], tile, done)
+        self.screen.sprite("missile", ox + i * ts, oy + j * ts, tile)
+        self.shell.after(35, self.fly, path[1:], tile, done)
 
     def missile_hit(self, mob, tile, dmg, skill):
         self.busy = False
@@ -3619,11 +4764,8 @@ class Game:
             self.catch_goose(mob)
             return
         self.talk = {"mob": mob, "mode": "kw"}
-        self.talkbar.pack(side="bottom", fill="x", before=self.log)
-        self.prompt.config(text="Your interest:")
-        self.entry.delete(0, "end")
-        if not ANDROID:             # don't pop up the on-screen keyboard
-            self.entry.focus_set()
+        # (on a phone, don't pop up the on-screen keyboard)
+        self.shell.show_entry(focus=not ANDROID)
         if self.p["beaver"] and not mob.lord:
             self.beaver_talk(mob)
             return
@@ -3658,7 +4800,7 @@ class Game:
     def beaver_talk(self, mob):
         """Nobody understands a beaver; there is no conversation."""
         self.talk = None
-        self.talkbar.pack_forget()
+        self.shell.hide_entry()
         self.say("You squeak and chitter at %s." % mob.title, "info")
         if mob.shop:
             line = "No beavers in the shop, please! Sorry, little fellow."
@@ -3716,14 +4858,12 @@ class Game:
     def end_talk(self):
         self.menu = None
         self.talk = None
-        self.talkbar.pack_forget()
-        self.canvas.focus_set()
+        self.shell.hide_entry()
         if hasattr(self, "p"):
             self.render()
 
     def on_entry(self, ev=None):
-        text = self.entry.get().strip()
-        self.entry.delete(0, "end")
+        text = self.shell.take_entry().strip()
         if not self.talk:
             return
         self.say("> " + (text or "bye"), "you")
@@ -3735,7 +4875,7 @@ class Game:
         mob = t["mob"]
         if t["mode"] == "buy":
             t["mode"] = "kw"
-            self.prompt.config(text="Your interest:")
+            self.shell.set_prompt("Your interest:")
             if w.isdigit():
                 self.buy(mob, int(w))
                 return
@@ -3860,7 +5000,7 @@ class Game:
         self.side[q["id"]]["state"] = "done"
         self.tally("errands")
         self.say("(+%d gold, +%d xp)" % (q["gold"], q["xp"]), "good")
-        self.root.after(200, self.sound.play, "quest")
+        self.shell.after(200, self.sound.play, "quest")
         self.save()
 
     def finish_errand(self, mob):
@@ -3985,7 +5125,7 @@ class Game:
             self.say("   %d) %-24s %5d gold" % (i, label, price), "gold")
         self.say("You have %d gold." % self.p["gold"], "info")
         self.talk["mode"] = "buy"
-        self.prompt.config(text="Which one (number)?")
+        self.shell.set_prompt("Which one (number)?")
 
     def buy(self, mob, n):
         p = self.p
@@ -4123,7 +5263,7 @@ class Game:
             self.say("Thou art now level %d! (+%d max HP)" % (p["level"],
                                                               gain), "quest")
         if raised:
-            self.root.after(300, self.sound.play, "level")
+            self.shell.after(300, self.sound.play, "level")
         if p["hp"] < p["maxhp"] or p["poison"] or p["mp"] < max_mp(p):
             p["hp"] = p["maxhp"]
             p["mp"] = max_mp(p)
@@ -4137,7 +5277,7 @@ class Game:
                          "And sorry it took so long to thank thee properly."
                          % self.world["realm"])
             self.show_feast()
-            self.root.after(300, self.sound.play, "quest")
+            self.shell.after(300, self.sound.play, "quest")
             self.save()
             return
         self.npc_say(mob, "Welcome, %s! How may I help thee, eh? (Ask me "
@@ -4231,29 +5371,21 @@ class Game:
         """(Re)build the grid of canvas items to fit the canvas."""
         if not hasattr(self, "area"):
             return
-        c = self.canvas
+        scr = self.screen
         scale = self.auto_scale()
         if scale != self.scale:
             self.scale = scale
-            self.scale_images()
-        c.delete("all")
+            scr.set_scale(scale)
         ts = 16 * self.scale
-        W, H = max(c.winfo_width(), ts * 5), max(c.winfo_height(), ts * 5)
+        W, H = scr.size()
+        W, H = max(W, ts * 5), max(H, ts * 5)
         cols, rows = W // ts, H // ts
         cols -= 1 - cols % 2
         rows -= 1 - rows % 2
         ox, oy = (W - cols * ts) // 2, (H - rows * ts) // 2
         self.view = (cols, rows, ox, oy, ts)
-        self.cells = []
-        for j in range(rows):
-            for i in range(cols):
-                x, y = ox + i * ts, oy + j * ts
-                self.cells.append((
-                    c.create_image(x, y, anchor="nw", state="hidden"),
-                    c.create_image(x, y, anchor="nw", state="hidden")))
-        self.shown = [(None, None)] * len(self.cells)
-        self.fx = c.create_image(0, 0, anchor="nw", state="hidden")
-        self.missile = c.create_image(0, 0, anchor="nw", state="hidden")
+        scr.grid(cols, rows, ox, oy, ts)
+        self.shown = [(None, None)] * (cols * rows)
         self.render()
 
     @staticmethod
@@ -4316,9 +5448,9 @@ class Game:
         return vis
 
     def render(self):
-        if not self.cells:
+        if not self.shown:
             return
-        c, a = self.canvas, self.area
+        scr, a = self.screen, self.area
         cols, rows = self.view[0], self.view[1]
         px, py = self.pos
         self.visible = vis = self.compute_visible()
@@ -4348,22 +5480,11 @@ class Game:
                 if old == (base, top):
                     continue
                 self.shown[idx] = (base, top)
-                bid, tid = self.cells[idx]
                 if base != old[0]:
-                    if base is None:
-                        c.itemconfig(bid, state="hidden")
-                    elif base[0] == "~":
-                        c.itemconfig(bid, image=self.dimg[base[1:]],
-                                     state="normal")
-                    else:
-                        c.itemconfig(bid, image=self.img[base],
-                                     state="normal")
+                    scr.cell(idx, 0, base)
                 if top != old[1]:
-                    if top is None:
-                        c.itemconfig(tid, state="hidden")
-                    else:
-                        c.itemconfig(tid, image=self.img[top], state="normal")
-        c.delete("overlay")
+                    scr.cell(idx, 1, top)
+        scr.clear_overlay()
         if self.overlay == "map":
             self.draw_map()
         elif self.overlay == "help":
@@ -4386,29 +5507,25 @@ class Game:
             return
         self.fx_token += 1
         token = self.fx_token
-        self.canvas.coords(self.fx, ox + i * ts, oy + j * ts)
-        self.canvas.itemconfig(self.fx, image=self.img[tile], state="normal")
-        self.canvas.tag_raise(self.fx)
+        self.screen.sprite("fx", ox + i * ts, oy + j * ts, tile)
 
         def hide():
             if token == self.fx_token:
-                self.canvas.itemconfig(self.fx, state="hidden")
-        self.root.after(160, hide)
+                self.screen.sprite("fx", 0, 0, None)
+        self.shell.after(160, hide)
 
     def draw_text_box(self, text, color=INK):
-        c = self.canvas
-        W, H = c.winfo_width(), c.winfo_height()
-        t = c.create_text(W / 2, H / 2, text=text, fill=color, font=F(*MONO),
-                          justify="left", tags="overlay")
-        x0, y0, x1, y1 = c.bbox(t)
-        r = c.create_rectangle(x0 - 20, y0 - 16, x1 + 20, y1 + 16,
-                               fill=PANEL, outline=ACCENT, width=2,
-                               tags="overlay")
-        c.tag_raise(t, r)
+        scr = self.screen
+        W, H = scr.size()
+        w, h = scr.text_size(text, F(*MONO))
+        x0, y0 = (W - w) / 2, (H - h) / 2
+        scr.rect(x0 - 20, y0 - 16, x0 + w + 20, y0 + h + 16, fill=PANEL,
+                 outline=ACCENT, width=2)
+        scr.text(W / 2, H / 2, text, F(*MONO), color)
 
     def draw_map(self):
-        c, a = self.canvas, self.world_area
-        W, H = c.winfo_width(), c.winfo_height()
+        scr, a = self.screen, self.world_area
+        W, H = scr.size()
         rows = []
         for y in range(WORLD_H):
             row = []
@@ -4418,28 +5535,23 @@ class Game:
                 else:
                     t = a.grid[y][x]
                     row.append(SITE_COLORS.get(t) or self.avg[t])
-            rows.append("{" + " ".join(row) + "}")
-        img = tk.PhotoImage(width=WORLD_W, height=WORLD_H)
-        img.put(" ".join(rows))
+            rows.append(row)
         z = max(1, int(min(W, H - 40) * 0.9) // WORLD_W)
-        self.map_img = img.zoom(z)
-        c.create_rectangle(0, 0, W, H, fill="black", tags="overlay")
-        mx, my = (W - WORLD_W * z) / 2, (H - WORLD_H * z) / 2 + 10
-        c.create_image(mx, my, image=self.map_img, anchor="nw",
-                       tags="overlay")
+        scr.rect(0, 0, W, H, fill="#000000")
+        mx, my = (W - WORLD_W * z) // 2, (H - WORLD_H * z) // 2 + 10
+        scr.map_image(rows, z, mx, my)
         px, py = self.pos if self.area.kind == "world" else self.world_pos
-        c.create_rectangle(mx + px * z - 2, my + py * z - 2,
-                           mx + (px + 1) * z + 2, my + (py + 1) * z + 2,
-                           outline="#ffff00", width=2, tags="overlay")
-        c.create_text(W / 2, my - 14, fill=ACCENT, font=F(*MONO), tags="overlay",
-                      text="Map of %s   (white: castle, red: towns, orange: "
-                      "dungeons; any key closes)" % self.world["realm"])
+        scr.rect(mx + px * z - 2, my + py * z - 2, mx + (px + 1) * z + 2,
+                 my + (py + 1) * z + 2, outline="#ffff00", width=2)
+        scr.text(W / 2, my - 14, "Map of %s   (white: castle, red: towns, "
+                 "orange: dungeons; any key closes)" % self.world["realm"],
+                 F(*MONO), ACCENT)
 
     def render_chrome(self):
         p = self.p
-        self.status.config(text=cap(self.area.name))
+        self.shell.set_status(cap(self.area.name))
         day, hour = self.clock()
-        self.turns.config(text="Day %d, %d %s (%s)" % (
+        self.shell.set_clock("Day %d, %d %s (%s)" % (
             day, (hour - 1) % 12 + 1, "am" if hour < 12 else "pm",
             self.phase()))
         need = ("%d" % xp_needed(p["level"]) if p["level"] < MAX_LEVEL
@@ -4486,7 +5598,7 @@ class Game:
             cond.append("STARVING")
         if 0 < p["hp"] <= self.max_hp() // 4:
             cond.append("BADLY HURT")
-        self.condition.config(text="\n".join(cond))
+        self.shell.set_condition("\n".join(cond))
         self.sound.tune = self.area.kind
 
     # ── The MIM Blueberry ──
@@ -4752,25 +5864,22 @@ class Game:
     def auto_scale(self):
         """Tiles big enough that the shorter side of the map shows about
         thirteen, plus however far the player has zoomed."""
-        c = self.canvas
-        short = min(c.winfo_width(), c.winfo_height())
+        short = min(self.screen.size())
         return max(1, min(MAX_ZOOM, round(short / (16 * 13)) + self.zoom_d))
 
-    def on_resize(self, ev):
-        if ev.widget is self.root:
-            if getattr(self, "fit_job", None):
-                self.root.after_cancel(self.fit_job)
-            self.fit_job = self.root.after(80, self.fit)
+    def on_resize(self):
+        if self.fit_job is not None:
+            self.shell.cancel(self.fit_job)
+        self.fit_job = self.shell.after(80, self.fit)
 
     def fit(self, force=False):
         """Scale the fonts, the side panel and the buttons to the window:
         a wide window has the panel at the side and one row of buttons, a
         tall one (a phone held upright) the panel underneath and two."""
         self.fit_job = None
-        if getattr(self, "small_dialog", None) and not force:
+        if self.shell.dialog_shrunk() and not force:
             return
-        root = self.root
-        W, H = root.winfo_width(), root.winfo_height()
+        W, H = self.shell.window_size()
         if W < 100 or H < 100:
             return
         tall = H > W * 1.15
@@ -4780,34 +5889,8 @@ class Game:
                 tall == getattr(self, "tall", None):
             return
         self.tall = tall
-        set_fonts(u)
-        n = len(self.btn)
-        root.update_idletasks()
-        each = max(b.winfo_reqwidth() for b in self.btn.values()) + S(4)
-        rows = 2 if tall else 1
-        while rows < n and -(-n // rows) * each > W:
-            rows += 1
-        per = -(-n // rows)
-        for i, b in enumerate(self.btn.values()):
-            b.grid(row=i // per, column=i % per, sticky="ew", padx=S(2),
-                   pady=S(4))
-        for col in range(n):
-            self.bar.columnconfigure(col, weight=int(col < per),
-                                     uniform="b" if col < per else "")
-        sb = self.sidebar
-        sb.pack_forget()
-        if tall:
-            sb.pack_propagate(True)
-            sb.pack(side="bottom", fill="x", before=self.leftside)
-            wrapl = (W - S(50)) // 2
-        else:
-            sb.configure(width=S(230))
-            sb.pack_propagate(False)
-            sb.pack(side="right", fill="y", before=self.leftside)
-            wrapl = S(210)
-        for w in (self.panel, self.panel2, self.condition):
-            w.configure(wraplength=wrapl if w is not self.condition or
-                        not tall else W - S(24))
+        self.shell.set_ui_scale(u)
+        self.shell.arrange(tall, W)
         if hasattr(self, "panel_lines"):
             self.show_panel(self.panel_lines)
         self.layout()
@@ -4817,8 +5900,7 @@ class Game:
         on a phone held upright, split at the blank line nearest halfway."""
         self.panel_lines = lines
         if not self.tall or len(lines) < 8:
-            self.panel.config(text="\n".join(lines))
-            self.panel2.pack_forget()
+            self.shell.set_panel(lines)
             return
         mid = len(lines) // 2
         cuts = [i for i, line in enumerate(lines) if not line.strip()]
@@ -4828,48 +5910,7 @@ class Game:
         first, second = lines[:cut], lines[cut:]
         while second and not second[0].strip():
             second = second[1:]
-        self.panel.config(text="\n".join(first))
-        self.panel2.config(text="\n".join(second))
-        if not self.panel2.winfo_manager():
-            self.panel2.pack(side="left", fill="x", expand=True, anchor="n",
-                             padx=(S(10), S(10)), pady=(S(8), 0))
-
-    def fit_dialog(self, dlg):
-        """Shrink a dialog that's too big for the window until it fits;
-        everything goes back to its usual size when it closes."""
-        root = self.root
-        root.update_idletasks()
-        self.fit()
-        W, H = root.winfo_width(), root.winfo_height()
-        if W < 100:
-            return
-        shrunk = False
-        for _ in range(5):
-            dlg.update_idletasks()
-            k = min(1.0, (W - 8) / max(1, dlg.winfo_reqwidth()),
-                    (H - 8) / max(1, dlg.winfo_reqheight()))
-            if k >= 1.0:
-                break
-            shrunk = True
-            set_fonts(UI[0] * k * 0.97)
-            todo = [dlg]
-            while todo:
-                w = todo.pop()
-                todo += w.winfo_children()
-                try:
-                    wl = int(w.cget("wraplength"))
-                except (tk.TclError, ValueError):
-                    continue
-                if wl:
-                    w.configure(wraplength=max(60, int(wl * k)))
-        if shrunk:
-            self.small_dialog = dlg
-
-            def closed(e):
-                if e.widget is dlg:
-                    self.small_dialog = None
-                    self.root.after_idle(self.fit, True)
-            dlg.bind("<Destroy>", closed, add="+")
+        self.shell.set_panel(first, second)
 
     def text_size(self, d):
         i = TEXT_SIZES.index(self.text_k) + d
@@ -5038,8 +6079,178 @@ def icon_build_app(dest):
     return app
 
 
+ANDROID_SPEC = """\
+[app]
+title = Penultimate
+package.name = penultimate
+package.domain = org.badgerjh
+source.dir = .
+source.include_exts = py,png
+# (files with no extension get in regardless: keep the build's tar out)
+source.exclude_patterns = tar
+version = 1.0
+# Kivy draws it; pyjnius reaches Android's MediaPlayer for the sound.
+# Kivy's recipe brings requests, and requests charset-normalizer, which
+# python-for-android would fetch as a compiled Android wheel and then fail
+# to install; naming its pure-Python wheel here keeps it out of the way.
+requirements = python3,kivy,pyjnius,charset-normalizer@https://files.pythonhosted.org/packages/fc/ad/d07d7862a62ffa6d79d68074d14823243dd235a77c45262acbf6adeb28bf/charset_normalizer-3.5.2-py3-none-any.whl
+orientation = portrait, landscape
+fullscreen = 0
+icon.filename = %(source.dir)s/icon.png
+presplash.filename = %(source.dir)s/icon.png
+android.presplash_color = #17130f
+# 64-bit ARM only: nearly every phone, and what the Play Store asks for.
+# (Building for two at once breaks python-for-android's pip: it makes the
+# same venv again for the second, over the first's upgraded pip.)
+android.archs = arm64-v8a
+android.allow_backup = True
+# say yes to Google's SDK licence, which would otherwise be asked for,
+# and wait for an answer that a Docker build can't give
+android.accept_sdk_license = True
+
+[buildozer]
+log_level = 2
+# in Docker under Colima the project looks root's, so Buildozer runs as
+# root there; don't stop to ask about it (it's harmless in a container)
+warn_on_root = 0
+"""
+
+
+ANDROID_TAR = r'''#!/home/user/.venv/bin/python3
+"""tar, for the kivy/buildozer image on a Mac.  Its GNU tar unpacks with
+the openat2 system call, which neither Rosetta nor QEMU can run, so every
+unpacking fails ("Cannot mkdir: Function not implemented").  This unpacks
+with Python's tarfile instead, refusing paths that leave the folder as GNU
+tar does, and hands anything else to the real tar.  Written by
+penultimate --build-android, and mounted over the image's tar."""
+import os
+import sys
+import tarfile
+
+REAL = "/usr/bin/tar"
+
+
+def real():
+    os.execv(REAL, [REAL] + sys.argv[1:])
+
+
+def main(args):
+    if not args:
+        real()
+    first = args[0].lstrip("-")
+    if args[0].startswith("--") or not first.isalpha() or "x" not in first:
+        real()                      # not unpacking: the real tar can
+    archive, dest, strip = None, ".", 0
+    rest = args[1:]
+    if "f" in first:
+        if not rest:
+            real()
+        archive, rest = rest[0], rest[1:]
+    while rest:
+        a = rest.pop(0)
+        if a == "-C" and rest:
+            dest = rest.pop(0)
+        elif a.startswith("--strip-components="):
+            strip = int(a.split("=", 1)[1])
+        elif a.startswith("--") and a in (
+                "--no-same-owner", "--no-same-permissions", "--overwrite"):
+            pass
+        else:
+            real()                  # members or options we don't know
+    if archive is None or archive == "-":
+        real()
+    with tarfile.open(archive) as tf:
+        members = []
+        for m in tf.getmembers():
+            if strip:
+                parts = m.name.split("/")[strip:]
+                if not parts or not parts[0]:
+                    continue
+                m.name = "/".join(parts)
+            members.append(m)
+        tf.extractall(dest, members=members, filter="tar")
+
+
+main(sys.argv[1:])
+'''
+
+
+ANDROID_BUILD = r'''#!/bin/sh
+# Build the Android app with Buildozer in Docker (kivy/buildozer), from
+# this folder wherever it's run from: ./build.sh, or ./build.sh with
+# Buildozer's own arguments (default: -v android debug).  The APK lands in
+# bin/.  Written by penultimate --build-android.
+#
+#   buildozer-home      Docker volume: Android's SDK and NDK.
+#   buildozer-platform  Docker volume: python-for-android and all it has
+#                       compiled (Python, SDL2, Kivy...), at
+#                       .buildozer/android/platform.  Both are shared by
+#                       every project built with this script, so the second
+#                       needn't download or compile them again; build one
+#                       at a time, all for the same arch (arm64-v8a).  They
+#                       live on Colima's Linux disk, since the NDK has names
+#                       a Mac's disk can't tell apart (xt_RATEEST.h and
+#                       xt_rateest.h).  The rest of .buildozer stays here.
+#   tar                 this folder's tar, over the image's own, which can't
+#                       unpack under Intel emulation on a Mac.
+#   .android            this folder's, as the container's ~/.android (at
+#                       /root too, since under Colima the build runs as
+#                       root and Java looks there): the
+#                       debug key the APK is signed with.  Without it each
+#                       build made a new key, and a phone refuses an update
+#                       signed with a different key ("App not installed").
+#                       Keep it: lose it and the app must be uninstalled
+#                       (and its saved game with it) before the next.
+#
+# It holds nothing of any one app: copy it, with tar, next to another
+# project's buildozer.spec to build that the same way.
+#
+# Before each build the pip venv python-for-android makes is cleared:
+# it makes it afresh over the old one, mixing two versions of pip.
+set -e
+cd "$(dirname "$0")"
+[ $# -gt 0 ] || set -- -v android debug
+exec docker run --rm --platform linux/amd64 \
+    -v buildozer-home:/home/user/.buildozer \
+    -v "$PWD":/home/user/hostcwd \
+    -v buildozer-platform:/home/user/hostcwd/.buildozer/android/platform \
+    -v "$PWD/tar":/usr/local/bin/tar:ro \
+    -v "$PWD/.android":/home/user/.android \
+    -v "$PWD/.android":/root/.android \
+    --entrypoint /bin/bash kivy/buildozer -c \
+    'rm -rf /home/user/hostcwd/.buildozer/android/platform/build-*/build/venv
+     exec /usr/local/bin/entrypoint.sh "$@"' build "$@"
+'''
+
+
+def build_android(dest):
+    """A folder for Buildozer to make an Android app of: the game as
+    main.py, its icon, a buildozer.spec (written only if there isn't one,
+    so that your changes to it stay), and build.sh and the tar it uses,
+    for building in Docker (see ANDROID_BUILD and ANDROID_TAR)."""
+    os.makedirs(dest, exist_ok=True)
+    for name, text in (("tar", ANDROID_TAR), ("build.sh", ANDROID_BUILD)):
+        path = os.path.join(dest, name)
+        with open(path, "w") as fh:
+            fh.write(text)
+        os.chmod(path, 0o755)
+    shutil.copy(os.path.abspath(__file__), os.path.join(dest, "main.py"))
+    with open(os.path.join(dest, "icon.png"), "wb") as fh:
+        fh.write(icon_render_png(512))
+    spec = os.path.join(dest, "buildozer.spec")
+    if not os.path.exists(spec):
+        with open(spec, "w") as fh:
+            fh.write(ANDROID_SPEC)
+    return dest
+
+
 def icon_args(args):
-    """Handle --build-app [DIR] and --icon-png SIZE [OUT]; True if handled."""
+    """Handle --build-app [DIR], --build-android [DIR] and --icon-png SIZE
+    [OUT]; True if handled."""
+    if args[:1] == ["--build-android"]:
+        print(build_android(args[1] if len(args) > 1 else os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), "android")))
+        return True
     if args[:1] == ["--build-app"]:
         print(icon_build_app(args[1] if len(args) > 1 else
                              os.path.dirname(os.path.abspath(__file__))))
@@ -5878,10 +7089,14 @@ def main():
     if "--selftest" in sys.argv:
         selftest()
         return
-    root = tk.Tk()
-    set_window_icon(root)
-    Game(root)
-    root.mainloop()
+    if "--kivy" in sys.argv or os.environ.get("PENULTIMATE_UI") == "kivy" \
+            or tk is None:
+        shell = KivyShell()
+    else:
+        shell = TkShell(tk.Tk())
+    Game(shell)
+    shell.set_icon()
+    shell.run()
 
 
 if __name__ == "__main__":

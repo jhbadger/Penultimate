@@ -26,6 +26,40 @@ python-tk`). Sound effects and music play through `afplay` (macOS),
 `paplay` or `aplay`, or through pygame's mixer if it is installed. If none
 of them is available, the game is silent.
 
+**With Kivy instead of Tk:** where [Kivy](https://kivy.org) is installed,
+`./penultimate --kivy` (or `PENULTIMATE_UI=kivy`) runs the same game in a
+Kivy window; a Python without Tk uses Kivy by itself. The game never
+imports Kivy by name, so Pydroid 3 on Android still runs it with Tk.
+
+**As an Android app:** `./penultimate --build-android [DIR]` makes a
+folder (`android/` by default) for
+[Buildozer](https://buildozer.readthedocs.io) to turn into an APK: the
+game as `main.py`, its icon, a `buildozer.spec`, and a `build.sh` for
+building in Docker. Run it again after changing the game; it leaves your
+changes to the spec alone. The app is built for 64-bit ARM phones.
+
+On a Mac, build in Docker with an engine such as
+[Colima](https://github.com/abiosoft/colima), started with Rosetta on Apple
+silicon (`colima start --vm-type vz --vz-rosetta --cpu 4 --memory 8 --disk
+60`), then:
+
+```bash
+android/build.sh
+```
+
+It runs the `kivy/buildozer` image with the same two Docker volumes as any
+other project built this way: `buildozer-home` (Android's SDK and NDK) and
+`buildozer-platform` (python-for-android and the Python, SDL2 and Kivy it
+has compiled), so a project after the first needn't download or compile
+them again. Build one project at a time. The script's comments explain the
+rest: a stand-in `tar` for the image's, which can't unpack under Intel
+emulation, and `android/.android`, which keeps the debug key the APK is
+signed with (lose it, and the app must be uninstalled, saved game and all,
+before the next one installs). The APK lands in `android/bin/`; install it
+with `adb install -r android/bin/*.apk`, or copy it to the phone and open
+it. The app saves when you switch away from it, and the phone's Back
+button closes menus and conversations.
+
 To build a macOS app with an icon:
 
 ```bash

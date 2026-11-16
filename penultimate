@@ -1645,6 +1645,14 @@ class Sound:
             atexit.register(self.stop_music)
             self.dir = tempfile.mkdtemp(prefix="penultimate-")
             atexit.register(shutil.rmtree, self.dir, True)
+
+    def begin(self):
+        """Make the effects and the music, on a thread of their own.  The
+        game calls this once its window is up: Python runs one thread at a
+        time, so making them while the game loads only slows the loading
+        (much, on a slow tablet), and until they're made nothing plays."""
+        if self.player and not getattr(self, "begun", False):
+            self.begun = True
             threading.Thread(target=self.synthesize, daemon=True).start()
 
     @staticmethod
@@ -3377,6 +3385,7 @@ class Game:
         except (KeyError, TypeError, ValueError, IndexError, zlib.error):
             # once the window is up, so the dialog can be fitted to it
             self.shell.after(50, self.new_game)
+        self.shell.after(300, self.sound.begin)     # once the map's up
         self.music_tick()
         self.animate()
         self.pad = Gamepad()

@@ -142,7 +142,8 @@ Other pads may number their buttons differently; `PAD_BUTTONS` near the
 top of the gamepad code maps them.
 
 **Talking.** Walk into a person, or into a shop counter with someone behind
-it, then type a word and press Return. Everyone knows NAME, JOB and BYE;
+it, then choose a word with the arrow keys (or tap it), or type one, and
+press Return. Everyone knows NAME, JOB and BYE;
 most people know NEWS, and words they say in CAPITALS are worth asking
 about. Shopkeepers answer BUY. Townsfolk know where the dungeons are and
 which boss holds which relic.

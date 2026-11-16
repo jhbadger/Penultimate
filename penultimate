@@ -17,7 +17,8 @@ beaver, with few hit points, only a bite to fight with, and no one able to
 understand you.  Only Lord Canadian can turn you back.
 
 Talking: walk into a person (or into a shop counter with someone behind it),
-then type a word and press Return.  Everyone knows NAME, JOB and BYE; most
+then choose a word with the arrow keys or type one, and press Return.
+Everyone knows NAME, JOB and BYE; most
 people know NEWS, and words in CAPITALS are worth asking about.  Shopkeepers
 answer BUY.  Lord Canadian heals you and raises your level when you have
 earned it.  Dying is not the end: Lord Canadian resurrects you, but your gold
@@ -2013,8 +2014,9 @@ B                   music on / off
 N                   new game (a whole new world)
 Ctrl-Q / Cmd-Q      quit (the game is saved)
 
-Talking: type a word and press Return. Everyone knows
-NAME, JOB and BYE; most know NEWS. Try words in CAPITALS.
+Talking: choose a word with the arrow keys, or type one,
+and press Return. Everyone knows NAME, JOB and BYE; most
+know NEWS. Try words in CAPITALS.
 Shopkeepers answer BUY; talk across their counters.
 
 Lord Canadian heals you and raises your level once you
@@ -2250,7 +2252,7 @@ class TkShell:
                               bd=1)
         self.entry.pack(side="left", fill="x", expand=True, padx=(0, 8),
                         pady=4)
-        self.entry.bind("<Return>", lambda e: game.on_entry())
+        self.entry.bind("<Return>", lambda e: game.on_entry() or "break")
         self.entry.bind("<Escape>", lambda e: game.end_talk())
         self.canvas = tk.Canvas(left, bg="black", highlightthickness=0)
         self.canvas.pack(fill="both", expand=True)
@@ -3280,6 +3282,9 @@ class KivyShell:
                 if key == 27:
                     game.end_talk()
                     return True
+                if key in (273, 274) and game.talk:
+                    game.on_key(Key(KIVY_KEYS[key], 0))     # choosing
+                    return True
                 return False            # typing a word to say
             name = KIVY_KEYS.get(key)
             if name is None and codepoint:
@@ -3726,6 +3731,17 @@ class Game:
     # ── Turns ──
 
     def on_key(self, ev):
+        if self.talk and self.menu and not self.busy and \
+                not ev.state & 0x0C:
+            # Talking: the arrow keys choose a word, Return says it.
+            # (Return in the box where you type is on_entry's.)
+            k = ev.keysym
+            if k in ("Up", "KP_Up", "Down", "KP_Down"):
+                self.menu_move(-1 if k.endswith("Up") else 1)
+                return
+            if k in ("Return", "KP_Enter"):
+                self.menu_pick()
+                return
         k = ev.keysym
         if self.talk and k == "Escape":
             self.end_talk()
@@ -4801,9 +4817,10 @@ class Game:
             self.finish_errand(mob)
         if "talked" not in self.flags:
             self.flags.add("talked")
-            self.say("(Choose what to ask about, or type a word such as "
-                     "NAME, JOB or NEWS and press Return. BYE, or an empty "
-                     "line, ends the conversation.)", "info")
+            self.say("(Choose what to ask about with the arrow keys and "
+                     "Return, or type a word such as NAME, JOB or NEWS and "
+                     "press Return. BYE, or Escape, ends the "
+                     "conversation.)", "info")
         self.talk_menu()
 
     def beaver_talk(self, mob):
@@ -4874,6 +4891,9 @@ class Game:
     def on_entry(self, ev=None):
         text = self.shell.take_entry().strip()
         if not self.talk:
+            return
+        if not text and self.menu:
+            self.menu_pick()            # the word the arrow keys chose
             return
         self.say("> " + (text or "bye"), "you")
         self.converse(text.lower())

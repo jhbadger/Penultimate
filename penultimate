@@ -1992,6 +1992,7 @@ MOVE_KEYS = {"Up": (0, -1), "w": (0, -1), "KP_Up": (0, -1), "KP_8": (0, -1),
              "KP_4": (-1, 0), "Right": (1, 0), "d": (1, 0),
              "KP_Right": (1, 0), "KP_6": (1, 0)}
 
+PAGED = ('help',)     # text boxes shown a page at a time
 HELP = """PENULTIMATE
 
 Arrow keys / WASD   move; walk into monsters to fight
@@ -2034,7 +2035,8 @@ Gamepad (Linux, Steam Deck): d-pad or stick moves,
 A waits or chooses, B backs out, X sling, Y cast,
 LB potion, RB Blueberry, View map, Start menu.
 
-Press any key to close."""
+Escape closes this; Space, Return or a tap turns the page.
+"""
 
 
 # ── The display layer ───────────────────────────────────────────────────────
@@ -3763,6 +3765,16 @@ class Game:
                 self.menu_cancel()
             return
         if self.overlay:
+            if self.overlay in PAGED:
+                if k in ("Left", "Up", "Prior", "BackSpace", "KP_Left",
+                         "KP_Up", "KP_Prior", "a", "w"):
+                    self.turn_page(-1)
+                    return
+                if k == "Escape" or (self.overlay == "help" and k in (
+                        "question", "slash", "?", "/", "h", "H", "F1")):
+                    self.overlay = None
+                    self.render()
+                    return
             if self.overlay == "won" and k in ("n", "N"):
                 self.new_game()
             elif k != "Escape" and self.next_page():
@@ -3794,15 +3806,15 @@ class Game:
             self.journal()
         elif k in ("l", "L"):
             self.blueberry()
-        elif k in ("question", "slash", "h", "H", "F1"):
+        elif k in ("question", "slash", "?", "/", "h", "H", "F1"):
             self.show_help()
         elif k in ("v", "V"):
             self.toggle_mute()
         elif k in ("b", "B"):
             self.toggle_music()
-        elif k in ("plus", "equal", "KP_Add"):
+        elif k in ("plus", "equal", "+", "=", "KP_Add"):
             self.zoom(1)
-        elif k in ("minus", "underscore", "KP_Subtract"):
+        elif k in ("minus", "underscore", "-", "_", "KP_Subtract"):
             self.zoom(-1)
         elif k in ("n", "N"):
             self.ask_new_game()
@@ -5514,10 +5526,12 @@ class Game:
                 if top != old[1]:
                     scr.cell(idx, 1, top)
         scr.clear_overlay()
+        if self.overlay not in PAGED:
+            self.paged_for = None
         if self.overlay == "map":
             self.draw_map()
         elif self.overlay == "help":
-            self.draw_text_box(HELP)
+            self.draw_paged(HELP)
         elif self.overlay == "won":
             if not getattr(self, "pages", None):
                 self.pages, self.page = self.feast_pages(), 0
@@ -5542,6 +5556,53 @@ class Game:
             if token == self.fx_token:
                 self.screen.sprite("fx", 0, 0, None)
         self.shell.after(160, hide)
+
+    def draw_paged(self, text):
+        """A text box too long for the screen, a page at a time."""
+        if getattr(self, "paged_for", None) != self.overlay:
+            self.paged_for, self.text_page = self.overlay, 0
+        pages = self.text_pages(text)
+        self.text_pages_n = len(pages)
+        self.text_page = min(self.text_page, len(pages) - 1)
+        body = pages[self.text_page]
+        if len(pages) > 1:
+            body += "\n\n(Page %d of %d. %s)" % (
+                self.text_page + 1, len(pages),
+                "Tap or Space for more, Left to go back" if self.text_page
+                < len(pages) - 1 else "Tap or Space to close, Left to "
+                "go back")
+        self.draw_text_box(body)
+
+    def text_pages(self, text):
+        """Split text into pages that fit the screen, between paragraphs
+        where it can."""
+        W, H = self.screen.size()
+        lh = max(1, self.screen.linespace(F(*MONO)))
+        room = max(6, int((H - 40) / lh) - 3)      # less the page footer
+        paras, cur = [], []
+        for line in text.split("\n"):
+            if line.strip():
+                cur.append(line)
+            elif cur:
+                paras.append(cur)
+                cur = []
+        if cur:
+            paras.append(cur)
+        pages, page = [], []
+        for para in paras:
+            while len(para) > room:                 # too long for any page
+                if page:
+                    pages.append(page)
+                    page = []
+                pages.append(para[:room])
+                para = para[room:]
+            if page and len(page) + 1 + len(para) > room:
+                pages.append(page)
+                page = []
+            page = page + ([""] if page else []) + para
+        if page:
+            pages.append(page)
+        return ["\n".join(p) for p in pages] or [""]
 
     def draw_text_box(self, text, color=INK):
         scr = self.screen
@@ -5859,9 +5920,21 @@ class Game:
                   "wandering."]
         return ["\n".join(feast), "\n".join(page2), "\n".join(later)]
 
+    def turn_page(self, d):
+        """A page on in a long text box; False if there are no more that
+        way."""
+        n = getattr(self, "text_page", 0) + d
+        if not 0 <= n < getattr(self, "text_pages_n", 1):
+            return False
+        self.text_page = n
+        self.render()
+        return True
+
     def next_page(self):
-        """Turn the page of the Blueberry or the feast; False at the
-        last one."""
+        """Turn the page of the Blueberry, the feast or the help; False at
+        the last one."""
+        if self.overlay in PAGED and self.turn_page(1):
+            return True
         pages = getattr(self, "pages", None)
         if self.overlay in ("phone", "won") and pages and \
                 self.page < len(pages) - 1:
